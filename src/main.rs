@@ -18,33 +18,33 @@ struct Cli {
 enum Commands {
     /// Run as Edge (public server with Web UI and QUIC listener)
     Edge {
-        /// Working directory (contains SQLite DB, certs, config)
+        /// Working directory (SQLite DB, certs, config.toml)
         #[arg(short = 'd', long, default_value = ".")]
         data_dir: String,
 
-        /// QUIC listen address for Agents
-        #[arg(long, default_value = "0.0.0.0:7844")]
-        quic_addr: String,
+        /// Override config.toml listen.quic
+        #[arg(long)]
+        quic_addr: Option<String>,
 
-        /// HTTP management panel listen address
-        #[arg(long, default_value = "0.0.0.0:8080")]
-        panel_addr: String,
+        /// Override config.toml listen.panel
+        #[arg(long)]
+        panel_addr: Option<String>,
 
-        /// Public HTTP listen address (for HTTP tunnels)
-        #[arg(long, default_value = "0.0.0.0:80")]
-        http_addr: String,
+        /// Override config.toml listen.http
+        #[arg(long)]
+        http_addr: Option<String>,
 
-        /// Public HTTPS listen address (for HTTP tunnels with TLS)
-        #[arg(long, default_value = "0.0.0.0:443")]
-        https_addr: String,
+        /// Override config.toml listen.https
+        #[arg(long)]
+        https_addr: Option<String>,
 
-        /// Panel basic auth username
-        #[arg(long, default_value = "admin")]
-        panel_user: String,
+        /// Override config.toml panel.user
+        #[arg(long)]
+        panel_user: Option<String>,
 
-        /// Panel basic auth password
-        #[arg(long, default_value = "tunnelx")]
-        panel_pass: String,
+        /// Override config.toml panel.password
+        #[arg(long)]
+        panel_pass: Option<String>,
     },
 
     /// Run as Agent (outbound connector to Edge)
@@ -84,16 +84,18 @@ async fn main() -> Result<()> {
             panel_user,
             panel_pass,
         } => {
-            edge::run(edge::EdgeConfig {
-                data_dir: data_dir.into(),
-                quic_addr: quic_addr.parse()?,
-                panel_addr: panel_addr.parse()?,
-                http_addr: http_addr.parse()?,
-                https_addr: https_addr.parse()?,
-                panel_user,
-                panel_pass,
-            })
-            .await
+            let config = edge::load_edge_config(
+                data_dir.into(),
+                edge::CliOverrides {
+                    quic_addr,
+                    panel_addr,
+                    http_addr,
+                    https_addr,
+                    panel_user,
+                    panel_pass,
+                },
+            )?;
+            edge::run(config).await
         }
         Commands::Agent { server, token, name } => {
             agent::run(agent::AgentConfig {
@@ -113,7 +115,6 @@ async fn main() -> Result<()> {
     }
 }
 
-// Minimal hostname helper without extra crate
 mod hostname {
     use std::ffi::OsString;
     pub fn get() -> Result<OsString, ()> {

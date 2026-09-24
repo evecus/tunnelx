@@ -1,3 +1,4 @@
+mod config;
 mod db;
 mod panel;
 mod quic;
@@ -10,6 +11,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
 
+pub use config::{load_edge_config, CliOverrides};
 pub use db::Db;
 pub use routing::AgentPool;
 
@@ -22,6 +24,12 @@ pub struct EdgeConfig {
     pub https_addr: SocketAddr,
     pub panel_user: String,
     pub panel_pass: String,
+    pub quic_cert: PathBuf,
+    pub quic_key: PathBuf,
+    pub quic_auto_self_signed: bool,
+    pub https_cert: PathBuf,
+    pub https_key: PathBuf,
+    pub https_enabled: bool,
 }
 
 pub struct EdgeState {
@@ -51,7 +59,7 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
     info!("  QUIC       = {}", config.quic_addr);
     info!("  panel      = http://{}", config.panel_addr);
     info!("  HTTP       = {}", config.http_addr);
-    info!("  HTTPS      = {}", config.https_addr);
+    info!("  HTTPS      = {} (enabled={})", config.https_addr, config.https_enabled);
 
     let quic_state = state.clone();
     tokio::spawn(async move {
@@ -67,12 +75,16 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
         }
     });
 
-    let https_state = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = routing::run_http_listener(https_state, true).await {
-            tracing::warn!("HTTPS listener not started: {e:#}");
-        }
-    });
+    if state.config.https_enabled {
+        let https_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = routing::run_http_listener(https_state, true).await {
+                tracing::warn!("HTTPS listener not started: {e:#}");
+            }
+        });
+    } else {
+        info!("HTTPS disabled in config");
+    }
 
     {
         let rules = state.db.list_all_tcp_rules().await?;
