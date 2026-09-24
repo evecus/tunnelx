@@ -6,7 +6,6 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Messages sent on the control stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum ControlMessage {

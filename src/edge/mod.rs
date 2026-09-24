@@ -28,7 +28,6 @@ pub struct EdgeState {
     pub config: EdgeConfig,
     pub db: Db,
     pub agents: AgentPool,
-    /// Current config version (incremented on every rule change)
     pub config_version: RwLock<u64>,
 }
 
@@ -54,7 +53,6 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
     info!("  HTTP       = {}", config.http_addr);
     info!("  HTTPS      = {}", config.https_addr);
 
-    // Spawn QUIC server for Agents
     let quic_state = state.clone();
     tokio::spawn(async move {
         if let Err(e) = quic::run_quic_server(quic_state).await {
@@ -62,7 +60,6 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
         }
     });
 
-    // Spawn public HTTP router (plain)
     let http_state = state.clone();
     tokio::spawn(async move {
         if let Err(e) = routing::run_http_listener(http_state, false).await {
@@ -70,7 +67,6 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
         }
     });
 
-    // Spawn public HTTPS router (if certs exist)
     let https_state = state.clone();
     tokio::spawn(async move {
         if let Err(e) = routing::run_http_listener(https_state, true).await {
@@ -78,7 +74,6 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
         }
     });
 
-    // Spawn TCP listeners for existing TCP rules
     {
         let rules = state.db.list_all_tcp_rules().await?;
         for rule in rules {
@@ -99,6 +94,25 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
         }
     }
 
-    // Management panel (blocking main task)
+    {
+        let rules = state.db.list_all_udp_rules().await?;
+        for rule in rules {
+            if let Some(port) = rule.public_port {
+                let st = state.clone();
+                let rule_id = match uuid::Uuid::parse_str(&rule.id) {
+                    Ok(id) => id,
+                    Err(_) => continue,
+                };
+                let port = port as u16;
+                let target = rule.target.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = routing::run_udp_listener(st, rule_id, port, target).await {
+                        tracing::error!("UDP listener :{port} error: {e:#}");
+                    }
+                });
+            }
+        }
+    }
+
     panel::run_panel(state).await
 }
