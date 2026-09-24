@@ -13,7 +13,7 @@ use super::EdgeState;
 use crate::common::{load_or_generate_quic_cert, make_quic_server_config};
 use crate::protocol::{
     encode_message, try_decode_message, ConfigUpdate, ControlMessage,
-    DataStreamHeader, DataStreamType, RegisterResponse,
+    DataStreamType, RegisterResponse,
 };
 
 pub async fn run_quic_server(state: Arc<EdgeState>) -> Result<()> {
@@ -97,8 +97,8 @@ async fn open_data_stream(conn: quinn::Connection, req: OpenStreamReq) -> Result
     send.write_all(&hdr).await?;
     match req.header.stream_type {
         DataStreamType::Tcp => {
-            let mut public = req.public_tcp.ok_or_else(|| anyhow!("missing public_tcp"))?;
-            let (mut pub_r, mut pub_w) = public.split();
+            let public = req.public_tcp.ok_or_else(|| anyhow!("missing public_tcp"))?;
+            let (mut pub_r, mut pub_w) = public.into_split();
             let t1 = tokio::spawn(async move {
                 let mut buf = [0u8; 16384];
                 loop {
