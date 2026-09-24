@@ -3,7 +3,6 @@ use bytes::Bytes;
 use http_body_util::BodyExt;
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -25,14 +24,13 @@ struct AgentState {
     config: AgentConfig,
     rules: RwLock<Vec<IngressRule>>,
     agent_id: Uuid,
-    started: Instant,
 }
 
 pub async fn run(config: AgentConfig) -> Result<()> {
     info!("Agent starting, connecting to {}", config.server);
     let agent_id = Uuid::new_v4();
     let state = Arc::new(AgentState {
-        config, rules: RwLock::new(Vec::new()), agent_id, started: Instant::now(),
+        config, rules: RwLock::new(Vec::new()), agent_id,
     });
     loop {
         match connect_and_run(state.clone()).await {
