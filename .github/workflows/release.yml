@@ -1,0 +1,102 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            arch: amd64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            arch: arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          BIN="target/${{ matrix.target }}/release/tunnelx"
+          OUT="tunnelx-linux-${{ matrix.arch }}"
+          cp "$BIN" "$OUT"
+          chmod +x "$OUT"
+          tar -czf "${OUT}.tar.gz" "$OUT"
+          sha256sum "${OUT}.tar.gz" > "${OUT}.tar.gz.sha256"
+          ls -lh "${OUT}"* 
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tunnelx-linux-${{ matrix.arch }}
+          path: |
+            tunnelx-linux-${{ matrix.arch }}
+            tunnelx-linux-${{ matrix.arch }}.tar.gz
+            tunnelx-linux-${{ matrix.arch }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find dist -type f \( -name '*.tar.gz' -o -name '*.sha256' -o -name 'tunnelx-linux-*' \) \
+            ! -name '*.tar.gz' -exec cp {} release/ \; 2>/dev/null || true
+          find dist -type f -name 'tunnelx-linux-*.tar.gz*' -exec cp {} release/ \;
+          ls -lah release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          generate_release_notes: true
+          files: |
+            release/tunnelx-linux-amd64
+            release/tunnelx-linux-amd64.tar.gz
+            release/tunnelx-linux-amd64.tar.gz.sha256
+            release/tunnelx-linux-arm64
+            release/tunnelx-linux-arm64.tar.gz
+            release/tunnelx-linux-arm64.tar.gz.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
