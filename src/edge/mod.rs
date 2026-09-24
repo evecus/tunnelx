@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
 
-pub use db::{Db, IngressRuleRow, TunnelRow};
+pub use db::Db;
 pub use routing::AgentPool;
 
 #[derive(Clone)]
