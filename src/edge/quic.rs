@@ -17,9 +17,13 @@ use crate::protocol::{
 };
 
 pub async fn run_quic_server(state: Arc<EdgeState>) -> Result<()> {
-    let cert_path = state.config.data_dir.join("certs/quic-cert.pem");
-    let key_path = state.config.data_dir.join("certs/quic-key.pem");
-    let (certs, key) = load_or_generate_quic_cert(&cert_path, &key_path)?;
+    let cert_path = &state.config.quic_cert;
+    let key_path = &state.config.quic_key;
+    let (certs, key) = load_or_generate_quic_cert(
+        cert_path,
+        key_path,
+        state.config.quic_auto_self_signed,
+    )?;
     let server_config = make_quic_server_config(certs, key)?;
     let endpoint = quinn::Endpoint::server(server_config, state.config.quic_addr)?;
     info!("QUIC server listening on {}", state.config.quic_addr);
