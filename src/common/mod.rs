@@ -10,6 +10,7 @@ use std::sync::Arc;
 pub fn load_or_generate_quic_cert(
     cert_path: &Path,
     key_path: &Path,
+    auto_self_signed: bool,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
     if cert_path.exists() && key_path.exists() {
         let cert_pem = fs::read(cert_path).context("read cert")?;
@@ -23,6 +24,14 @@ pub fn load_or_generate_quic_cert(
         return Ok((certs, key));
     }
 
+    if !auto_self_signed {
+        anyhow::bail!(
+            "QUIC certs not found at {} / {} and quic_auto_self_signed=false",
+            cert_path.display(),
+            key_path.display()
+        );
+    }
+    tracing::info!("generating self-signed QUIC certificate");
     let certified = rcgen::generate_simple_self_signed(vec!["localhost".into(), "tunnelx".into()])?;
     let cert_der = certified.cert.der().clone();
     let key_der = PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
@@ -129,7 +138,6 @@ pub fn load_https_server_config(
         .context("parse private key PEM")?
         .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path.display()))?;
 
-    // Ensure crypto provider is installed (idempotent)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mut config = rustls::ServerConfig::builder()
