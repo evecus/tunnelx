@@ -122,10 +122,10 @@ async fn handle_data_stream(state: Arc<AgentState>, mut send: quinn::SendStream,
     match header.stream_type {
         DataStreamType::Tcp => {
             let target = parse_target(&rule.target)?;
-            let mut local = tokio::net::TcpStream::connect(&target).await
+            let local = tokio::net::TcpStream::connect(&target).await
                 .with_context(|| format!("connect to {target}"))?;
             info!("TCP proxy {} <-> {}", header.rule_id, target);
-            let (mut local_r, mut local_w) = local.split();
+            let (mut local_r, mut local_w) = local.into_split();
             let t1 = tokio::spawn(async move {
                 let mut buf = [0u8; 16384];
                 loop {
