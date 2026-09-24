@@ -47,7 +47,7 @@ fn unauthorized() -> impl IntoResponse {
 }
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('\"', "&quot;")
 }
 
 async fn index(State(state): State<Arc<EdgeState>>, auth: Option<TypedHeader<Authorization<Basic>>>) -> impl IntoResponse {
@@ -135,6 +135,12 @@ form{{margin:1rem 0}}input,button{{padding:6px 10px;margin:4px}}
 <input name="target" placeholder="tcp://127.0.0.1:22" required>
 <input name="public_port" type="number" placeholder="2222" required>
 <button class="btn" type="submit">Add TCP</button></form>
+<h3>Add UDP Rule</h3>
+<form method="post" action="/tunnels/{id}/rules">
+<input type="hidden" name="service_type" value="udp">
+<input name="target" placeholder="udp://127.0.0.1:51820" required>
+<input name="public_port" type="number" placeholder="51820" required>
+<button class="btn" type="submit">Add UDP</button></form>
 <form method="post" action="/tunnels/{id}" onsubmit="return confirm('Delete?')">
 <button class="btn btn-danger" type="submit">Delete Tunnel</button></form>
 </body></html>"#,
@@ -153,7 +159,11 @@ struct AddRuleForm {
 async fn add_rule(State(state): State<Arc<EdgeState>>, Path(tunnel_id): Path<String>,
     auth: Option<TypedHeader<Authorization<Basic>>>, Form(form): Form<AddRuleForm>) -> impl IntoResponse {
     if check_auth(&state, auth).await.is_err() { return unauthorized().into_response(); }
-    let st = if form.service_type == "tcp" { ServiceType::Tcp } else { ServiceType::Http };
+    let st = match form.service_type.as_str() {
+        "tcp" => ServiceType::Tcp,
+        "udp" => ServiceType::Udp,
+        _ => ServiceType::Http,
+    };
     match state.db.add_rule(&tunnel_id, form.hostname.as_deref(), None, st, &form.target, form.public_port).await {
         Ok(rule) => {
             *state.config_version.write().await += 1;
@@ -165,6 +175,18 @@ async fn add_rule(State(state): State<Arc<EdgeState>>, Path(tunnel_id): Path<Str
                     tokio::spawn(async move {
                         if let Err(e) = super::routing::run_tcp_listener(st2, rid, port, target).await {
                             tracing::error!("TCP listener :{port}: {e:#}");
+                        }
+                    });
+                }
+            }
+            if st == ServiceType::Udp {
+                if let Some(port) = form.public_port {
+                    let st2 = state.clone();
+                    let rid = Uuid::parse_str(&rule.id).unwrap();
+                    let target = rule.target.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = super::routing::run_udp_listener(st2, rid, port, target).await {
+                            tracing::error!("UDP listener :{port}: {e:#}");
                         }
                     });
                 }
