@@ -1,0 +1,43 @@
+name: Clippy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run clippy
+        id: clippy
+        run: |
+          set -o pipefail
+          cargo clippy --all-targets --message-format=short -- -W clippy::all -W clippy::pedantic 2>&1 | tee clippy.log
+          exit ${PIPESTATUS[0]}
+
+      - name: Upload clippy log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: clippy-log
+          path: clippy.log
+          if-no-files-found: ignore
