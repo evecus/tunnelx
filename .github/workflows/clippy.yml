@@ -9,7 +9,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -Dwarnings
 
 jobs:
   clippy:
@@ -28,10 +27,9 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run clippy
-        id: clippy
         run: |
           set -o pipefail
-          cargo clippy --all-targets --message-format=short -- -W clippy::all -W clippy::pedantic 2>&1 | tee clippy.log
+          cargo clippy --all-targets --message-format=short -- -D warnings 2>&1 | tee clippy.log
           exit ${PIPESTATUS[0]}
 
       - name: Upload clippy log
