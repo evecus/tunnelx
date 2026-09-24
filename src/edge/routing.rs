@@ -75,7 +75,9 @@ impl AgentPool {
     }
 }
 
-/// Public HTTP/HTTPS listener. For MVP HTTPS just tries to load certs from data_dir/certs.
+/// Public HTTP/HTTPS listener.
+/// When `tls` is true, loads `data_dir/certs/fullchain.pem` + `privkey.pem`
+/// and terminates TLS with rustls before handing connections to hyper.
 pub async fn run_http_listener(state: Arc<EdgeState>, tls: bool) -> Result<()> {
     let addr = if tls {
         state.config.https_addr
@@ -83,42 +85,70 @@ pub async fn run_http_listener(state: Arc<EdgeState>, tls: bool) -> Result<()> {
         state.config.http_addr
     };
 
-    let listener = TcpListener::bind(addr).await.context("bind http")?;
-    info!("{} listening on {}", if tls { "HTTPS" } else { "HTTP" }, addr);
-
-    // For MVP we only implement plain HTTP. TLS termination can be added later
-    // by loading certs from data_dir/certs/fullchain.pem + privkey.pem.
-    if tls {
+    let tls_acceptor = if tls {
         let cert_path = state.config.data_dir.join("certs/fullchain.pem");
         let key_path = state.config.data_dir.join("certs/privkey.pem");
         if !cert_path.exists() || !key_path.exists() {
             return Err(anyhow!(
-                "HTTPS certs not found at {} / {} – skipping HTTPS listener",
+                "HTTPS certs not found at {} / {} – place fullchain.pem and privkey.pem there, or disable HTTPS",
                 cert_path.display(),
                 key_path.display()
             ));
         }
-        // TODO: real TLS with rustls. For now skip.
-        return Err(anyhow!("HTTPS not yet implemented – put certs and use a reverse proxy for now"));
-    }
+        let server_config = crate::common::load_https_server_config(&cert_path, &key_path)?;
+        Some(tokio_rustls::TlsAcceptor::from(server_config))
+    } else {
+        None
+    };
+
+    let listener = TcpListener::bind(addr).await.context("bind http")?;
+    info!(
+        "{} listening on {}",
+        if tls { "HTTPS" } else { "HTTP" },
+        addr
+    );
 
     loop {
         let (stream, peer) = listener.accept().await?;
         let state = state.clone();
+        let tls_acceptor = tls_acceptor.clone();
         tokio::spawn(async move {
-            let io = TokioIo::new(stream);
-            let service = service_fn(move |req| {
-                let state = state.clone();
-                async move { handle_http_request(state, req).await }
-            });
-            if let Err(e) = hyper::server::conn::http1::Builder::new()
-                .serve_connection(io, service)
-                .await
-            {
-                debug!("HTTP connection from {peer} error: {e}");
+            let result = async {
+                if let Some(acceptor) = tls_acceptor {
+                    let tls_stream = acceptor
+                        .accept(stream)
+                        .await
+                        .map_err(|e| anyhow!("TLS handshake from {peer}: {e}"))?;
+                    serve_http1(state, tls_stream, peer).await
+                } else {
+                    serve_http1(state, stream, peer).await
+                }
+            }
+            .await;
+            if let Err(e) = result {
+                debug!("HTTP(S) connection from {peer}: {e:#}");
             }
         });
     }
+}
+
+async fn serve_http1<S>(
+    state: Arc<EdgeState>,
+    stream: S,
+    peer: SocketAddr,
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let io = TokioIo::new(stream);
+    let service = service_fn(move |req| {
+        let state = state.clone();
+        async move { handle_http_request(state, req).await }
+    });
+    hyper::server::conn::http1::Builder::new()
+        .serve_connection(io, service)
+        .await
+        .map_err(|e| anyhow!("HTTP conn from {peer}: {e}"))
 }
 
 async fn handle_http_request(

@@ -110,6 +110,36 @@ impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
     }
 }
 
+/// Load HTTPS server TLS config from PEM files (fullchain + privkey).
+pub fn load_https_server_config(
+    cert_path: &Path,
+    key_path: &Path,
+) -> Result<Arc<rustls::ServerConfig>> {
+    let cert_pem = fs::read(cert_path)
+        .with_context(|| format!("read cert {}", cert_path.display()))?;
+    let key_pem = fs::read(key_path)
+        .with_context(|| format!("read key {}", key_path.display()))?;
+    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .collect::<Result<_, _>>()
+        .context("parse certificate PEM")?;
+    if certs.is_empty() {
+        anyhow::bail!("no certificates found in {}", cert_path.display());
+    }
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .context("parse private key PEM")?
+        .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path.display()))?;
+
+    // Ensure crypto provider is installed (idempotent)
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let mut config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("build rustls ServerConfig")?;
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(Arc::new(config))
+}
+
 pub fn generate_token() -> String {
     use rand::RngCore;
     let mut bytes = [0u8; 32];
