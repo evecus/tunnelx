@@ -30,6 +30,7 @@ pub struct IngressRuleRow {
     pub target: String,
     pub public_port: Option<i64>,
     pub enabled: i64,
+    #[allow(dead_code)]
     pub created_at: String,
 }
 
