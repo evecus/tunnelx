@@ -1,7 +1,7 @@
 //! Wire protocol between Edge and Agent over QUIC.
 //!
 //! - Stream 0 is the control channel (bi-directional).
-//! - Subsequent bi-directional streams are data channels (HTTP or TCP).
+//! - Subsequent bi-directional streams are data channels (HTTP / TCP / UDP).
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -10,16 +10,11 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum ControlMessage {
-    /// Agent → Edge: register with token
     Register(RegisterRequest),
-    /// Edge → Agent: registration result + initial config
     RegisterResponse(RegisterResponse),
-    /// Edge → Agent: full or partial config update
     ConfigUpdate(ConfigUpdate),
-    /// Either side: keepalive
     Ping,
     Pong,
-    /// Agent → Edge: status report
     AgentStatus(AgentStatus),
 }
 
@@ -52,7 +47,7 @@ pub struct IngressRule {
     pub path_prefix: Option<String>,
     pub service_type: ServiceType,
     pub target: String,
-    /// Only for TCP: the public port Edge binds
+    /// For TCP/UDP: the public port Edge binds
     pub public_port: Option<u16>,
     pub enabled: bool,
 }
@@ -62,6 +57,7 @@ pub struct IngressRule {
 pub enum ServiceType {
     Http,
     Tcp,
+    Udp,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,7 +67,6 @@ pub struct AgentStatus {
     pub uptime_secs: u64,
 }
 
-/// Header sent at the beginning of a data stream so the other side knows what it is.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataStreamHeader {
     pub rule_id: Uuid,
@@ -81,13 +76,12 @@ pub struct DataStreamHeader {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DataStreamType {
-    /// Full HTTP request/response will be proxied on this stream
     Http,
-    /// Raw TCP bidirectional copy
     Tcp,
+    /// Framed UDP datagrams: each packet is [u32 BE len][payload]
+    Udp,
 }
 
-/// Encode a control message with a length prefix (u32 BE).
 pub fn encode_message(msg: &ControlMessage) -> anyhow::Result<Vec<u8>> {
     let payload = bincode::serialize(msg)?;
     let mut buf = Vec::with_capacity(4 + payload.len());
@@ -96,7 +90,6 @@ pub fn encode_message(msg: &ControlMessage) -> anyhow::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Decode one length-prefixed message from a buffer. Returns (message, bytes_consumed).
 pub fn try_decode_message(buf: &[u8]) -> anyhow::Result<Option<(ControlMessage, usize)>> {
     if buf.len() < 4 {
         return Ok(None);
