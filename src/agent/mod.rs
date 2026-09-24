@@ -147,6 +147,41 @@ async fn handle_data_stream(state: Arc<AgentState>, mut send: quinn::SendStream,
             });
             let _ = tokio::join!(t1, t2);
         }
+        DataStreamType::Udp => {
+            let target = parse_target(&rule.target)?;
+            let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.context("bind local udp")?;
+            sock.connect(&target).await.with_context(|| format!("connect udp to {target}"))?;
+            info!("UDP proxy {} <-> {}", header.rule_id, target);
+            let sock = Arc::new(sock);
+            let sock2 = sock.clone();
+            let t1 = tokio::spawn(async move {
+                loop {
+                    let mut len_buf = [0u8; 4];
+                    if recv.read_exact(&mut len_buf).await.is_err() { break; }
+                    let len = u32::from_be_bytes(len_buf) as usize;
+                    if len == 0 || len > 65535 { break; }
+                    let mut pkt = vec![0u8; len];
+                    if recv.read_exact(&mut pkt).await.is_err() { break; }
+                    if sock.send(&pkt).await.is_err() { break; }
+                }
+            });
+            let t2 = tokio::spawn(async move {
+                let mut buf = vec![0u8; 65535];
+                loop {
+                    match sock2.recv(&mut buf).await {
+                        Ok(n) if n > 0 => {
+                            let mut frame = Vec::with_capacity(4 + n);
+                            frame.extend_from_slice(&(n as u32).to_be_bytes());
+                            frame.extend_from_slice(&buf[..n]);
+                            if send.write_all(&frame).await.is_err() { break; }
+                        }
+                        _ => break,
+                    }
+                }
+                let _ = send.finish();
+            });
+            let _ = tokio::join!(t1, t2);
+        }
         DataStreamType::Http => {
             let mut len_buf = [0u8; 4];
             recv.read_exact(&mut len_buf).await?;
@@ -187,7 +222,8 @@ async fn handle_data_stream(state: Arc<AgentState>, mut send: quinn::SendStream,
 }
 
 fn parse_target(target: &str) -> Result<String> {
-    let t = target.strip_prefix("tcp://").or_else(|| target.strip_prefix("http://"))
+    let t = target.strip_prefix("tcp://").or_else(|| target.strip_prefix("udp://"))
+        .or_else(|| target.strip_prefix("http://"))
         .or_else(|| target.strip_prefix("https://")).unwrap_or(target);
     Ok(t.to_string())
 }
