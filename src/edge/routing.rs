@@ -1,14 +1,13 @@
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use dashmap::DashMap;
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
@@ -215,8 +214,6 @@ pub async fn run_tcp_listener(
     let listener = TcpListener::bind(addr).await.context("bind tcp")?;
     info!("TCP listener on :{public_port} for rule {rule_id}");
 
-    // We need the tunnel_id; look it up once
-    // For simplicity we store rule_id and look up tunnel on each connection via DB.
     loop {
         let (public_stream, peer) = listener.accept().await?;
         let state = state.clone();
@@ -234,7 +231,6 @@ async fn handle_tcp_connection(
     public_stream: TcpStream,
     _peer: SocketAddr,
 ) -> Result<()> {
-    // Find which tunnel this rule belongs to
     let rules = state.db.list_all_tcp_rules().await?;
     let rule = rules
         .into_iter()
@@ -261,6 +257,5 @@ async fn handle_tcp_connection(
         .open_stream
         .send(open)
         .map_err(|_| anyhow!("agent disconnected"))?;
-    // The Agent side (inside the QUIC handler) will take the TcpStream and bidirectional copy.
     Ok(())
 }
