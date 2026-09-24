@@ -1,0 +1,157 @@
+use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::Response;
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
+use uuid::Uuid;
+
+use super::routing::{AgentHandle, OpenStreamReq};
+use super::EdgeState;
+use crate::common::{load_or_generate_quic_cert, make_quic_server_config};
+use crate::protocol::{
+    encode_message, try_decode_message, ConfigUpdate, ControlMessage,
+    DataStreamHeader, DataStreamType, RegisterResponse,
+};
+
+pub async fn run_quic_server(state: Arc<EdgeState>) -> Result<()> {
+    let cert_path = state.config.data_dir.join("certs/quic-cert.pem");
+    let key_path = state.config.data_dir.join("certs/quic-key.pem");
+    let (certs, key) = load_or_generate_quic_cert(&cert_path, &key_path)?;
+    let server_config = make_quic_server_config(certs, key)?;
+    let endpoint = quinn::Endpoint::server(server_config, state.config.quic_addr)?;
+    info!("QUIC server listening on {}", state.config.quic_addr);
+    while let Some(connecting) = endpoint.accept().await {
+        let state = state.clone();
+        tokio::spawn(async move {
+            match connecting.await {
+                Ok(conn) => {
+                    if let Err(e) = handle_agent_connection(state, conn).await {
+                        warn!("agent connection closed: {e:#}");
+                    }
+                }
+                Err(e) => warn!("QUIC accept error: {e}"),
+            }
+        });
+    }
+    Ok(())
+}
+
+async fn handle_agent_connection(state: Arc<EdgeState>, conn: quinn::Connection) -> Result<()> {
+    let remote = conn.remote_address();
+    info!("new QUIC connection from {remote}");
+    let (mut send, mut recv) = conn.accept_bi().await.context("accept control stream")?;
+    let mut buf = vec![0u8; 65536];
+    let n = recv.read(&mut buf).await?.ok_or_else(|| anyhow!("eof on control"))?;
+    let (msg, _) = try_decode_message(&buf[..n])?.ok_or_else(|| anyhow!("incomplete register"))?;
+    let ControlMessage::Register(reg) = msg else { return Err(anyhow!("expected Register")); };
+    let tunnel = state.db.get_tunnel_by_token(&reg.token).await?.ok_or_else(|| anyhow!("invalid token"))?;
+    let tunnel_id = Uuid::parse_str(&tunnel.id)?;
+    let rules = state.db.rules_for_tunnel(&tunnel.id).await?;
+    let version = *state.config_version.read().await;
+    let resp = ControlMessage::RegisterResponse(RegisterResponse {
+        ok: true, tunnel_id: Some(tunnel_id), message: "ok".into(),
+        config: Some(ConfigUpdate { version, rules }),
+    });
+    send.write_all(&encode_message(&resp)?).await?;
+    info!("Agent {} ({}) registered for tunnel {} ({})", reg.agent_name, reg.agent_id, tunnel.name, tunnel_id);
+    let (tx, mut rx) = mpsc::unbounded_channel::<OpenStreamReq>();
+    state.agents.register(tunnel_id, AgentHandle { agent_id: reg.agent_id, agent_name: reg.agent_name.clone(), open_stream: tx });
+    let conn2 = conn.clone();
+    let open_task = tokio::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            let conn = conn2.clone();
+            tokio::spawn(async move { if let Err(e) = open_data_stream(conn, req).await { error!("open data stream: {e:#}"); } });
+        }
+    });
+    let mut ctrl_buf = Vec::new();
+    loop {
+        match recv.read_chunk(8192, true).await {
+            Ok(Some(chunk)) => {
+                ctrl_buf.extend_from_slice(&chunk.bytes);
+                while let Ok(Some((msg, consumed))) = try_decode_message(&ctrl_buf) {
+                    ctrl_buf.drain(..consumed);
+                    if matches!(msg, ControlMessage::Ping) {
+                        send.write_all(&encode_message(&ControlMessage::Pong)?).await?;
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(e) => { warn!("control stream error: {e}"); break; }
+        }
+    }
+    state.agents.unregister(tunnel_id, reg.agent_id);
+    open_task.abort();
+    info!("Agent {} disconnected", reg.agent_id);
+    Ok(())
+}
+
+async fn open_data_stream(conn: quinn::Connection, req: OpenStreamReq) -> Result<()> {
+    let (mut send, mut recv) = conn.open_bi().await.context("open bi stream")?;
+    let header_bytes = bincode::serialize(&req.header)?;
+    let mut hdr = Vec::with_capacity(4 + header_bytes.len());
+    hdr.extend_from_slice(&(header_bytes.len() as u32).to_be_bytes());
+    hdr.extend_from_slice(&header_bytes);
+    send.write_all(&hdr).await?;
+    match req.header.stream_type {
+        DataStreamType::Tcp => {
+            let mut public = req.public_tcp.ok_or_else(|| anyhow!("missing public_tcp"))?;
+            let (mut pub_r, mut pub_w) = public.split();
+            let t1 = tokio::spawn(async move {
+                let mut buf = [0u8; 16384];
+                loop {
+                    match pub_r.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => { if send.write_all(&buf[..n]).await.is_err() { break; } }
+                    }
+                }
+                let _ = send.finish();
+            });
+            let t2 = tokio::spawn(async move {
+                let mut buf = [0u8; 16384];
+                loop {
+                    match recv.read(&mut buf).await {
+                        Ok(Some(n)) if n > 0 => { if pub_w.write_all(&buf[..n]).await.is_err() { break; } }
+                        _ => break,
+                    }
+                }
+            });
+            let _ = tokio::join!(t1, t2);
+        }
+        DataStreamType::Http => {
+            let mut http_req = req.http_req.ok_or_else(|| anyhow!("missing http_req"))?;
+            let tx = req.http_tx.ok_or_else(|| anyhow!("missing http_tx"))?;
+            let body_bytes = http_req.body_mut().collect().await?.to_bytes();
+            let method = http_req.method().as_str().to_string();
+            let uri = http_req.uri().to_string();
+            let mut headers = Vec::new();
+            for (k, v) in http_req.headers() {
+                if let Ok(v) = v.to_str() { headers.push((k.as_str().to_string(), v.to_string())); }
+            }
+            #[derive(serde::Serialize)]
+            struct HttpReqWire { method: String, uri: String, headers: Vec<(String, String)>, body: Vec<u8> }
+            let wire = HttpReqWire { method, uri, headers, body: body_bytes.to_vec() };
+            let payload = bincode::serialize(&wire)?;
+            send.write_all(&(payload.len() as u32).to_be_bytes()).await?;
+            send.write_all(&payload).await?;
+            send.finish()?;
+            let mut len_buf = [0u8; 4];
+            recv.read_exact(&mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut resp_buf = vec![0u8; len];
+            recv.read_exact(&mut resp_buf).await?;
+            #[derive(serde::Deserialize)]
+            struct HttpRespWire { status: u16, headers: Vec<(String, String)>, body: Vec<u8> }
+            let resp_wire: HttpRespWire = bincode::deserialize(&resp_buf)?;
+            let mut builder = Response::builder().status(resp_wire.status);
+            for (k, v) in resp_wire.headers { builder = builder.header(k, v); }
+            let response = builder.body(Full::new(Bytes::from(resp_wire.body))).unwrap_or_else(|_| {
+                Response::builder().status(502).body(Full::new(Bytes::from("bad response"))).unwrap()
+            });
+            let _ = tx.send(response);
+        }
+    }
+    Ok(())
+}
