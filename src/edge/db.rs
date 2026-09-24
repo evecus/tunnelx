@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
-use sqlx::Row;
 use std::path::Path;
 use uuid::Uuid;
 
@@ -179,6 +178,16 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn list_rules(&self, tunnel_id: &str) -> Result<Vec<IngressRuleRow>> {
+        let rows = sqlx::query_as::<_, IngressRuleRow>(
+            "SELECT * FROM ingress_rules WHERE tunnel_id = ? ORDER BY hostname",
+        )
+        .bind(tunnel_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
     }
 
     pub async fn rules_for_tunnel(&self, tunnel_id: &str) -> Result<Vec<IngressRule>> {
