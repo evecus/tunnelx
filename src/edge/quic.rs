@@ -152,6 +152,32 @@ async fn open_data_stream(conn: quinn::Connection, req: OpenStreamReq) -> Result
             });
             let _ = tx.send(response);
         }
+        DataStreamType::Udp => {
+            let mut to_agent = req.udp_to_agent.ok_or_else(|| anyhow!("missing udp_to_agent"))?;
+            let from_agent = req.udp_from_agent.ok_or_else(|| anyhow!("missing udp_from_agent"))?;
+            let t1 = tokio::spawn(async move {
+                while let Some(pkt) = to_agent.recv().await {
+                    if pkt.len() > 65535 { continue; }
+                    let mut frame = Vec::with_capacity(4 + pkt.len());
+                    frame.extend_from_slice(&(pkt.len() as u32).to_be_bytes());
+                    frame.extend_from_slice(&pkt);
+                    if send.write_all(&frame).await.is_err() { break; }
+                }
+                let _ = send.finish();
+            });
+            let t2 = tokio::spawn(async move {
+                loop {
+                    let mut len_buf = [0u8; 4];
+                    if recv.read_exact(&mut len_buf).await.is_err() { break; }
+                    let len = u32::from_be_bytes(len_buf) as usize;
+                    if len == 0 || len > 65535 { break; }
+                    let mut pkt = vec![0u8; len];
+                    if recv.read_exact(&mut pkt).await.is_err() { break; }
+                    if from_agent.send(pkt).await.is_err() { break; }
+                }
+            });
+            let _ = tokio::join!(t1, t2);
+        }
     }
     Ok(())
 }
