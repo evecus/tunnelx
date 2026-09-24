@@ -73,8 +73,8 @@ pub async fn run_http_listener(state: Arc<EdgeState>, tls: bool) -> Result<()> {
     let addr = if tls { state.config.https_addr } else { state.config.http_addr };
 
     let tls_acceptor = if tls {
-        let cert_path = state.config.data_dir.join("certs/fullchain.pem");
-        let key_path = state.config.data_dir.join("certs/privkey.pem");
+        let cert_path = state.config.https_cert.clone();
+        let key_path = state.config.https_key.clone();
         if !cert_path.exists() || !key_path.exists() {
             return Err(anyhow!(
                 "HTTPS certs not found at {} / {}",
