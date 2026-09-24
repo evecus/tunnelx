@@ -23,6 +23,7 @@ pub struct AgentPool {
 #[derive(Clone)]
 pub struct AgentHandle {
     pub agent_id: Uuid,
+    #[allow(dead_code)]
     pub agent_name: String,
     pub open_stream: mpsc::UnboundedSender<OpenStreamReq>,
 }
@@ -299,13 +300,8 @@ pub async fn run_udp_listener(
         let socket2 = socket.clone();
         let sessions2 = sessions.clone();
         tokio::spawn(async move {
-            loop {
-                match timeout(Duration::from_secs(60), from_agent_rx.recv()).await {
-                    Ok(Some(pkt)) => {
-                        let _ = socket2.send_to(&pkt, client_addr).await;
-                    }
-                    _ => break,
-                }
+            while let Ok(Some(pkt)) = timeout(Duration::from_secs(60), from_agent_rx.recv()).await {
+                let _ = socket2.send_to(&pkt, client_addr).await;
             }
             sessions2.lock().await.remove(&client_addr);
             debug!("UDP session {client_addr} closed");
