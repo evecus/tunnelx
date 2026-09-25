@@ -55,9 +55,13 @@ async fn connect_and_run(state: Arc<AgentState>) -> Result<()> {
         agent_name: state.config.name.clone(), version: env!("CARGO_PKG_VERSION").to_string(),
     });
     send.write_all(&encode_message(&reg)?).await?;
-    let mut buf = vec![0u8; 65536];
-    let n = recv.read(&mut buf).await?.ok_or_else(|| anyhow!("eof waiting register response"))?;
-    let (msg, _) = try_decode_message(&buf[..n])?.ok_or_else(|| anyhow!("incomplete response"))?;
+    // Read length-prefixed RegisterResponse
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf).await.context("read register response len")?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; len];
+    recv.read_exact(&mut payload).await.context("read register response body")?;
+    let msg: ControlMessage = bincode::deserialize(&payload).context("decode register response")?;
     match msg {
         ControlMessage::RegisterResponse(resp) if resp.ok => {
             info!("registered, tunnel_id={:?}", resp.tunnel_id);
