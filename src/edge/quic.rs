@@ -16,17 +16,49 @@ use crate::protocol::{
     DataStreamType, RegisterResponse,
 };
 
-pub async fn run_quic_server(state: Arc<EdgeState>) -> Result<()> {
+pub async fn run_quic_server(
+    state: Arc<EdgeState>,
+    ready: Option<tokio::sync::oneshot::Sender<Result<()>>>,
+) -> Result<()> {
+    let notify = |r: Result<()>| {
+        if let Some(tx) = ready {
+            let _ = tx.send(r);
+        }
+    };
+
     let cert_path = &state.config.quic_cert;
     let key_path = &state.config.quic_key;
-    let (certs, key) = load_or_generate_quic_cert(
+    let (certs, key) = match load_or_generate_quic_cert(
         cert_path,
         key_path,
         state.config.quic_auto_self_signed,
-    )?;
-    let server_config = make_quic_server_config(certs, key)?;
-    let endpoint = quinn::Endpoint::server(server_config, state.config.quic_addr)?;
-    info!("QUIC server listening on {}", state.config.quic_addr);
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            notify(Err(anyhow!("{e:#}")));
+            return Err(e);
+        }
+    };
+    let server_config = match make_quic_server_config(certs, key) {
+        Ok(c) => c,
+        Err(e) => {
+            notify(Err(anyhow!("{e:#}")));
+            return Err(e);
+        }
+    };
+    let endpoint = match quinn::Endpoint::server(server_config, state.config.quic_addr) {
+        Ok(ep) => ep,
+        Err(e) => {
+            let msg = format!("bind QUIC UDP on {}: {e}", state.config.quic_addr);
+            notify(Err(anyhow!("{msg}")));
+            return Err(anyhow!("{msg}"));
+        }
+    };
+    info!(
+        "QUIC server listening on UDP {} (Agents connect here)",
+        state.config.quic_addr
+    );
+    notify(Ok(()));
     while let Some(connecting) = endpoint.accept().await {
         let state = state.clone();
         tokio::spawn(async move {

@@ -56,17 +56,31 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
 
     info!("Edge starting");
     info!("  data_dir   = {}", config.data_dir.display());
-    info!("  QUIC       = {}", config.quic_addr);
+    info!("  QUIC       = UDP {}", config.quic_addr);
     info!("  panel      = http://{}", config.panel_addr);
     info!("  HTTP       = {}", config.http_addr);
     info!("  HTTPS      = {} (enabled={})", config.https_addr, config.https_enabled);
 
+    // QUIC uses UDP. Verify with: ss -ulnp | grep <port>
     let quic_state = state.clone();
+    let quic_addr = config.quic_addr;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        if let Err(e) = quic::run_quic_server(quic_state).await {
+        if let Err(e) = quic::run_quic_server(quic_state, Some(ready_tx)).await {
             tracing::error!("QUIC server error: {e:#}");
         }
     });
+    match ready_rx.await {
+        Ok(Ok(())) => {
+            info!("QUIC ready on UDP {quic_addr}");
+        }
+        Ok(Err(e)) => {
+            anyhow::bail!("QUIC failed to start on UDP {quic_addr}: {e:#}");
+        }
+        Err(_) => {
+            anyhow::bail!("QUIC task exited before signaling ready on UDP {quic_addr}");
+        }
+    }
 
     let http_state = state.clone();
     tokio::spawn(async move {
