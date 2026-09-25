@@ -18,6 +18,7 @@ pub struct TunnelRow {
     pub id: String,
     pub name: String,
     pub token: String,
+    #[allow(dead_code)]
     pub created_at: String,
 }
 
