@@ -24,30 +24,34 @@ pub async fn run_panel(state: Arc<EdgeState>) -> Result<()> {
         .route("/tunnels/:id", get(tunnel_detail).post(delete_tunnel))
         .route("/tunnels/:id/rules", post(add_rule))
         .route("/rules/:id/delete", post(delete_rule))
-        .layer(TraceLayer::new_for_http())
-        .with_state(state.clone());
+        .with_state(state.clone())
+        .layer(TraceLayer::new_for_http());
 
-    let listener = tokio::net::TcpListener::bind(state.config.panel_addr).await?;
-    info!("Management panel at http://{}", state.config.panel_addr);
-    info!("  login: {} / {}", state.config.panel_user, state.config.panel_pass);
+    let addr = state.config.panel_addr;
+    info!("panel listening on http://{addr}");
+    let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-async fn check_auth(state: &EdgeState, auth: Option<TypedHeader<Authorization<Basic>>>) -> Result<(), StatusCode> {
-    match auth {
-        Some(TypedHeader(Authorization(basic)))
-            if basic.username() == state.config.panel_user && basic.password() == state.config.panel_pass => Ok(()),
-        _ => Err(StatusCode::UNAUTHORIZED),
+async fn check_auth(
+    state: &EdgeState,
+    auth: Option<TypedHeader<Authorization<Basic>>>,
+) -> Result<(), ()> {
+    let TypedHeader(Authorization(basic)) = auth.ok_or(())?;
+    if basic.username() == state.config.panel_user && basic.password() == state.config.panel_pass {
+        Ok(())
+    } else {
+        Err(())
     }
 }
 
 fn unauthorized() -> impl IntoResponse {
-    (StatusCode::UNAUTHORIZED, [("WWW-Authenticate", "Basic realm=\"tunnelx\"")], "Unauthorized")
-}
-
-fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('\"', "&quot;")
+    (
+        StatusCode::UNAUTHORIZED,
+        [("WWW-Authenticate", "Basic realm=\"tunnelx\"")],
+        "unauthorized",
+    )
 }
 
 async fn index(State(state): State<Arc<EdgeState>>, auth: Option<TypedHeader<Authorization<Basic>>>) -> impl IntoResponse {
@@ -60,25 +64,20 @@ async fn list_tunnels(State(state): State<Arc<EdgeState>>, auth: Option<TypedHea
     let tunnels = state.db.list_tunnels().await.unwrap_or_default();
     let mut rows = String::new();
     for t in &tunnels {
-        let n = state.agents.count(&Uuid::parse_str(&t.id).unwrap_or_default());
+        let agents = state.agents.count(&Uuid::parse_str(&t.id).unwrap_or_default());
         rows.push_str(&format!(
-            "<tr><td><a href=\"/tunnels/{}\">{}</a></td><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
-            t.id, esc(&t.name), &t.token[..16.min(t.token.len())], n, t.created_at
+            r#"<tr><td><a href="/tunnels/{id}">{name}</a></td><td><code>{token}</code></td><td>{agents}</td>
+            <td><form method="post" action="/tunnels/{id}" style="display:inline" onsubmit="return confirm('Delete?')">
+            <button type="submit">Delete</button></form></td></tr>"#,
+            id = t.id, name = t.name, token = t.token, agents = agents,
         ));
     }
-    Html(format!(r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>tunnelx</title>
-<style>body{{font-family:system-ui;max-width:960px;margin:2rem auto;padding:0 1rem}}
-table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:8px;text-align:left}}
-th{{background:#f4f4f4}}code{{background:#f0f0f0;padding:2px 6px}}form{{margin:1.5rem 0}}
-input,button{{padding:6px 10px;margin-right:6px}}.btn{{background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer}}
-.btn-danger{{background:#dc2626}}</style></head><body>
-<h1>tunnelx Edge</h1><p>Self-hosted Cloudflare Tunnel alternative</p>
-<h2>Tunnels</h2><table><tr><th>Name</th><th>Token</th><th>Agents</th><th>Created</th></tr>
-{rows}</table>
-<h3>Create Tunnel</h3>
-<form method="post" action="/tunnels"><input name="name" placeholder="my-tunnel" required>
-<button class="btn" type="submit">Create</button></form>
-</body></html>"#, rows=rows)).into_response()
+    Html(format!(r#"<!DOCTYPE html><html><head><title>tunnelx</title>
+<style>body{{font-family:system-ui;margin:2rem}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:8px;text-align:left}}code{{font-size:0.85em;word-break:break-all}}</style></head>
+<body><h1>Tunnels</h1>
+<form method="post" action="/tunnels"><input name="name" placeholder="tunnel name" required> <button type="submit">Create</button></form>
+<table><tr><th>Name</th><th>Token</th><th>Agents</th><th></th></tr>{rows}</table>
+</body></html>"#)).into_response()
 }
 
 #[derive(Deserialize)]
@@ -87,8 +86,8 @@ struct CreateTunnelForm { name: String }
 async fn create_tunnel(State(state): State<Arc<EdgeState>>, auth: Option<TypedHeader<Authorization<Basic>>>, Form(form): Form<CreateTunnelForm>) -> impl IntoResponse {
     if check_auth(&state, auth).await.is_err() { return unauthorized().into_response(); }
     match state.db.create_tunnel(&form.name).await {
-        Ok(t) => { info!("created tunnel {} ({})", t.name, t.id); Redirect::to(&format!("/tunnels/{}", t.id)).into_response() }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("error: {e:#}")).into_response(),
+        Ok(t) => Redirect::to(&format!("/tunnels/{}", t.id)).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
 }
 
@@ -96,55 +95,59 @@ async fn tunnel_detail(State(state): State<Arc<EdgeState>>, Path(id): Path<Strin
     if check_auth(&state, auth).await.is_err() { return unauthorized().into_response(); }
     let tunnel = match state.db.get_tunnel(&id).await {
         Ok(Some(t)) => t,
-        _ => return (StatusCode::NOT_FOUND, "tunnel not found").into_response(),
+        _ => return (StatusCode::NOT_FOUND, "not found").into_response(),
     };
     let rules = state.db.list_rules(&id).await.unwrap_or_default();
     let agents = state.agents.count(&Uuid::parse_str(&id).unwrap_or_default());
     let mut rule_rows = String::new();
     for r in &rules {
         rule_rows.push_str(&format!(
-            "<tr><td>{}</td><td>{}</td><td><code>{}</code></td><td>{}</td><td>
-            <form method=\"post\" action=\"/rules/{}/delete\" style=\"display:inline\">
-            <button class=\"btn btn-danger\" type=\"submit\">Delete</button></form></td></tr>",
-            r.service_type, r.hostname.as_deref().unwrap_or("-"), esc(&r.target),
-            r.public_port.map(|p| p.to_string()).unwrap_or_else(|| "-".into()), r.id
+            r#"<tr><td>{stype}</td><td>{host}</td><td>{port}</td><td><code>{target}</code></td>
+            <td><form method="post" action="/rules/{rid}/delete" onsubmit="return confirm('Delete rule?')"><button>Delete</button></form></td></tr>"#,
+            stype = r.service_type,
+            host = r.hostname.as_deref().unwrap_or("-"),
+            port = r.public_port.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+            target = r.target,
+            rid = r.id,
         ));
     }
-    Html(format!(r#"<!DOCTYPE html><html><head><meta charset="utf-8"><title>{name} – tunnelx</title>
-<style>body{{font-family:system-ui;max-width:960px;margin:2rem auto;padding:0 1rem}}
-table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #ddd;padding:8px}}
-th{{background:#f4f4f4}}code{{background:#f0f0f0;padding:2px 6px;word-break:break-all}}
-form{{margin:1rem 0}}input,button{{padding:6px 10px;margin:4px}}
-.btn{{background:#2563eb;color:#fff;border:none;border-radius:4px;cursor:pointer}}
-.btn-danger{{background:#dc2626}}.token{{background:#fef3c7;padding:8px;border-radius:4px}}</style></head><body>
-<p><a href="/tunnels">← Back</a></p><h1>{name}</h1>
-<p>Agents online: <strong>{agents}</strong></p>
-<div class="token"><strong>Token</strong>:<br><code>{token}</code></div>
-<h2>Ingress Rules</h2>
-<table><tr><th>Type</th><th>Hostname</th><th>Target</th><th>Port</th><th></th></tr>
-{rule_rows}</table>
-<h3>Add HTTP Rule</h3>
+    Html(format!(r#"<!DOCTYPE html><html><head><title>{name}</title>
+<style>body{{font-family:system-ui;margin:2rem}}table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #ccc;padding:8px}}code{{font-size:0.85em}}fieldset{{margin:1rem 0;padding:1rem}}</style></head>
+<body><p><a href="/tunnels">&larr; Back</a></p>
+<h1>{name}</h1>
+<p>Token: <code>{token}</code></p>
+<p>Online agents: <b>{agents}</b></p>
+<p>Agent command:</p>
+<pre>./tunnelx agent --server EDGE_IP:QUIC_PORT --token {token}</pre>
+
+<h2>Rules</h2>
+<table><tr><th>Type</th><th>Hostname</th><th>Public Port</th><th>Target</th><th></th></tr>{rule_rows}</table>
+
+<h2>Add HTTP Rule</h2>
 <form method="post" action="/tunnels/{id}/rules">
 <input type="hidden" name="service_type" value="http">
 <input name="hostname" placeholder="app.example.com" required>
-<input name="target" placeholder="http://127.0.0.1:3000" required>
-<button class="btn" type="submit">Add HTTP</button></form>
-<h3>Add TCP Rule</h3>
+<input name="target" placeholder="http://127.0.0.1:8080" required>
+<button type="submit">Add HTTP</button>
+</form>
+
+<h2>Add TCP Rule</h2>
 <form method="post" action="/tunnels/{id}/rules">
 <input type="hidden" name="service_type" value="tcp">
 <input name="target" placeholder="tcp://127.0.0.1:22" required>
-<input name="public_port" type="number" placeholder="2222" required>
-<button class="btn" type="submit">Add TCP</button></form>
-<h3>Add UDP Rule</h3>
+<input name="public_port" type="number" placeholder="public port e.g. 2222" required>
+<button type="submit">Add TCP</button>
+</form>
+
+<h2>Add UDP Rule</h2>
 <form method="post" action="/tunnels/{id}/rules">
 <input type="hidden" name="service_type" value="udp">
-<input name="target" placeholder="udp://127.0.0.1:51820" required>
-<input name="public_port" type="number" placeholder="51820" required>
-<button class="btn" type="submit">Add UDP</button></form>
-<form method="post" action="/tunnels/{id}" onsubmit="return confirm('Delete?')">
-<button class="btn btn-danger" type="submit">Delete Tunnel</button></form>
+<input name="target" placeholder="udp://127.0.0.1:53" required>
+<input name="public_port" type="number" placeholder="public port e.g. 5353" required>
+<button type="submit">Add UDP</button>
+</form>
 </body></html>"#,
-        name=esc(&tunnel.name), agents=agents, token=tunnel.token, id=id, rule_rows=rule_rows
+        name = tunnel.name, token = tunnel.token, agents = agents, id = id, rule_rows = rule_rows,
     )).into_response()
 }
 
@@ -191,6 +194,16 @@ async fn add_rule(State(state): State<Arc<EdgeState>>, Path(tunnel_id): Path<Str
                     });
                 }
             }
+            // Push updated rules to online agents for this tunnel
+            if let Ok(tid) = Uuid::parse_str(&tunnel_id) {
+                let version = *state.config_version.read().await;
+                if let Ok(rules) = state.db.rules_for_tunnel(&tunnel_id).await {
+                    state.agents.broadcast_config(
+                        &tid,
+                        crate::protocol::ConfigUpdate { version, rules },
+                    );
+                }
+            }
             Redirect::to(&format!("/tunnels/{tunnel_id}")).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
@@ -202,6 +215,14 @@ async fn delete_rule(State(state): State<Arc<EdgeState>>, Path(id): Path<String>
     if check_auth(&state, auth).await.is_err() { return unauthorized().into_response(); }
     let _ = state.db.delete_rule(&id).await;
     *state.config_version.write().await += 1;
+    if let Ok(tunnels) = state.db.list_tunnels().await {
+        let version = *state.config_version.read().await;
+        for t in tunnels {
+            if let (Ok(tid), Ok(rules)) = (Uuid::parse_str(&t.id), state.db.rules_for_tunnel(&t.id).await) {
+                state.agents.broadcast_config(&tid, crate::protocol::ConfigUpdate { version, rules });
+            }
+        }
+    }
     Redirect::to("/tunnels").into_response()
 }
 
