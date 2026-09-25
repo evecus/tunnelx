@@ -70,6 +70,9 @@ async fn connect_and_run(state: Arc<AgentState>) -> Result<()> {
         ControlMessage::RegisterResponse(resp) => return Err(anyhow!("register rejected: {}", resp.message)),
         _ => return Err(anyhow!("unexpected response")),
     }
+
+    // Keep Connection + Endpoint alive for the whole session
+    let _conn_keep = conn.clone();
     let conn2 = conn.clone();
     let state2 = state.clone();
     let data_task = tokio::spawn(async move {
@@ -82,25 +85,53 @@ async fn connect_and_run(state: Arc<AgentState>) -> Result<()> {
             });
         }
     });
+
+    // Application-level keepalive on the control stream
+    let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(15));
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping_interval.tick().await; // consume immediate first tick
+
+    info!("session up, holding control channel");
     let mut ctrl_buf = Vec::new();
     loop {
-        match recv.read_chunk(8192, true).await {
-            Ok(Some(chunk)) => {
-                ctrl_buf.extend_from_slice(&chunk.bytes);
-                while let Ok(Some((msg, consumed))) = try_decode_message(&ctrl_buf) {
-                    ctrl_buf.drain(..consumed);
-                    match msg {
-                        ControlMessage::ConfigUpdate(cfg) => apply_config(&state, cfg).await,
-                        ControlMessage::Ping => send.write_all(&encode_message(&ControlMessage::Pong)?).await?,
-                        _ => {}
+        tokio::select! {
+            _ = ping_interval.tick() => {
+                if let Err(e) = send.write_all(&encode_message(&ControlMessage::Ping)?).await {
+                    warn!("control ping failed: {e}");
+                    break;
+                }
+            }
+            chunk = recv.read_chunk(8192, true) => {
+                match chunk {
+                    Ok(Some(chunk)) => {
+                        ctrl_buf.extend_from_slice(&chunk.bytes);
+                        while let Ok(Some((msg, consumed))) = try_decode_message(&ctrl_buf) {
+                            ctrl_buf.drain(..consumed);
+                            match msg {
+                                ControlMessage::ConfigUpdate(cfg) => apply_config(&state, cfg).await,
+                                ControlMessage::Ping => {
+                                    send.write_all(&encode_message(&ControlMessage::Pong)?).await?;
+                                }
+                                ControlMessage::Pong => {}
+                                _ => {}
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        info!("control stream finished by Edge");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!("control error: {e}");
+                        break;
                     }
                 }
             }
-            Ok(None) => break,
-            Err(e) => { warn!("control error: {e}"); break; }
         }
     }
     data_task.abort();
+    drop(_conn_keep);
+    drop(endpoint);
     Ok(())
 }
 
