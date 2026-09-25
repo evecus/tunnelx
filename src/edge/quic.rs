@@ -75,15 +75,61 @@ pub async fn run_quic_server(
     Ok(())
 }
 
+async fn read_one_message(recv: &mut quinn::RecvStream) -> Result<ControlMessage> {
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf).await.context("read msg len")?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len == 0 || len > 16 * 1024 * 1024 {
+        anyhow::bail!("invalid control message length {len}");
+    }
+    let mut payload = vec![0u8; len];
+    recv.read_exact(&mut payload).await.context("read msg payload")?;
+    bincode::deserialize(&payload).context("decode control message")
+}
+
 async fn handle_agent_connection(state: Arc<EdgeState>, conn: quinn::Connection) -> Result<()> {
     let remote = conn.remote_address();
     info!("new QUIC connection from {remote}");
     let (mut send, mut recv) = conn.accept_bi().await.context("accept control stream")?;
-    let mut buf = vec![0u8; 65536];
-    let n = recv.read(&mut buf).await?.ok_or_else(|| anyhow!("eof on control"))?;
-    let (msg, _) = try_decode_message(&buf[..n])?.ok_or_else(|| anyhow!("incomplete register"))?;
-    let ControlMessage::Register(reg) = msg else { return Err(anyhow!("expected Register")); };
-    let tunnel = state.db.get_tunnel_by_token(&reg.token).await?.ok_or_else(|| anyhow!("invalid token"))?;
+
+    let msg = match read_one_message(&mut recv).await {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("register read from {remote}: {e:#}");
+            let resp = ControlMessage::RegisterResponse(RegisterResponse {
+                ok: false, tunnel_id: None, message: format!("bad register: {e:#}"), config: None,
+            });
+            let _ = send.write_all(&encode_message(&resp)?).await;
+            return Err(e);
+        }
+    };
+    let ControlMessage::Register(reg) = msg else {
+        let resp = ControlMessage::RegisterResponse(RegisterResponse {
+            ok: false, tunnel_id: None, message: "expected Register".into(), config: None,
+        });
+        let _ = send.write_all(&encode_message(&resp)?).await;
+        anyhow::bail!("expected Register from {remote}");
+    };
+
+    let tunnel = match state.db.get_tunnel_by_token(&reg.token).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            warn!("invalid token from {remote} agent={}", reg.agent_name);
+            let resp = ControlMessage::RegisterResponse(RegisterResponse {
+                ok: false, tunnel_id: None, message: "invalid token".into(), config: None,
+            });
+            let _ = send.write_all(&encode_message(&resp)?).await;
+            anyhow::bail!("invalid token from {remote}");
+        }
+        Err(e) => {
+            let resp = ControlMessage::RegisterResponse(RegisterResponse {
+                ok: false, tunnel_id: None, message: format!("db error: {e:#}"), config: None,
+            });
+            let _ = send.write_all(&encode_message(&resp)?).await;
+            return Err(e);
+        }
+    };
+
     let tunnel_id = Uuid::parse_str(&tunnel.id)?;
     let rules = state.db.rules_for_tunnel(&tunnel.id).await?;
     let version = *state.config_version.read().await;
