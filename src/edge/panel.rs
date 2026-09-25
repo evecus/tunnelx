@@ -24,6 +24,7 @@ pub async fn run_panel(state: Arc<EdgeState>) -> Result<()> {
         .route("/tunnels/:id", get(tunnel_detail).post(delete_tunnel))
         .route("/tunnels/:id/rules", post(add_rule))
         .route("/rules/:id/delete", post(delete_rule))
+        .route("/rules/:id/toggle", post(toggle_rule))
         .with_state(state.clone())
         .layer(TraceLayer::new_for_http());
 
@@ -101,14 +102,34 @@ async fn tunnel_detail(State(state): State<Arc<EdgeState>>, Path(id): Path<Strin
     let agents = state.agents.count(&Uuid::parse_str(&id).unwrap_or_default());
     let mut rule_rows = String::new();
     for r in &rules {
+        let enabled = r.enabled != 0;
+        let status = if enabled { "启用" } else { "停用" };
+        let toggle_label = if enabled { "停用" } else { "启用" };
+        let status_style = if enabled { "color:green" } else { "color:#999" };
         rule_rows.push_str(&format!(
-            r#"<tr><td>{stype}</td><td>{host}</td><td>{port}</td><td><code>{target}</code></td>
-            <td><form method="post" action="/rules/{rid}/delete" onsubmit="return confirm('Delete rule?')"><button>Delete</button></form></td></tr>"#,
+            r#"<tr>
+            <td>{stype}</td>
+            <td>{host}</td>
+            <td>{port}</td>
+            <td><code>{target}</code></td>
+            <td style="{status_style}">{status}</td>
+            <td style="white-space:nowrap">
+              <form method="post" action="/rules/{rid}/toggle" style="display:inline">
+                <button type="submit">{toggle_label}</button>
+              </form>
+              <form method="post" action="/rules/{rid}/delete" style="display:inline" onsubmit="return confirm('Delete rule?')">
+                <button type="submit">删除</button>
+              </form>
+            </td>
+            </tr>"#,
             stype = r.service_type,
             host = r.hostname.as_deref().unwrap_or("-"),
             port = r.public_port.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
             target = r.target,
             rid = r.id,
+            status = status,
+            status_style = status_style,
+            toggle_label = toggle_label,
         ));
     }
     Html(format!(r#"<!DOCTYPE html><html><head><title>{name}</title>
@@ -121,7 +142,7 @@ async fn tunnel_detail(State(state): State<Arc<EdgeState>>, Path(id): Path<Strin
 <pre>./tunnelx agent --server EDGE_IP:QUIC_PORT --token {token}</pre>
 
 <h2>Rules</h2>
-<table><tr><th>Type</th><th>Hostname</th><th>Public Port</th><th>Target</th><th></th></tr>{rule_rows}</table>
+<table><tr><th>Type</th><th>Hostname</th><th>Public Port</th><th>Target</th><th>状态</th><th>操作</th></tr>{rule_rows}</table>
 
 <h2>Add HTTP Rule</h2>
 <form method="post" action="/tunnels/{id}/rules">
@@ -194,7 +215,6 @@ async fn add_rule(State(state): State<Arc<EdgeState>>, Path(tunnel_id): Path<Str
                     });
                 }
             }
-            // Push updated rules to online agents for this tunnel
             if let Ok(tid) = Uuid::parse_str(&tunnel_id) {
                 let version = *state.config_version.read().await;
                 if let Ok(rules) = state.db.rules_for_tunnel(&tunnel_id).await {
@@ -208,6 +228,62 @@ async fn add_rule(State(state): State<Arc<EdgeState>>, Path(tunnel_id): Path<Str
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
     }
+}
+
+async fn toggle_rule(State(state): State<Arc<EdgeState>>, Path(id): Path<String>,
+    auth: Option<TypedHeader<Authorization<Basic>>>) -> impl IntoResponse {
+    if check_auth(&state, auth).await.is_err() { return unauthorized().into_response(); }
+    let rule = match state.db.get_rule(&id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, "rule not found").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+    };
+    let new_enabled = rule.enabled == 0;
+    if let Err(e) = state.db.set_rule_enabled(&id, new_enabled).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
+    }
+    *state.config_version.write().await += 1;
+
+    // If enabling a TCP/UDP rule, ensure a public listener is running.
+    if new_enabled {
+        if let Some(port) = rule.public_port {
+            let port = port as u16;
+            let rid = match Uuid::parse_str(&rule.id) {
+                Ok(u) => u,
+                Err(_) => return Redirect::to(&format!("/tunnels/{}", rule.tunnel_id)).into_response(),
+            };
+            let st2 = state.clone();
+            let target = rule.target.clone();
+            match rule.service_type.as_str() {
+                "tcp" => {
+                    tokio::spawn(async move {
+                        if let Err(e) = super::routing::run_tcp_listener(st2, rid, port, target).await {
+                            tracing::warn!("TCP listener :{port} (re-enable): {e:#}");
+                        }
+                    });
+                }
+                "udp" => {
+                    tokio::spawn(async move {
+                        if let Err(e) = super::routing::run_udp_listener(st2, rid, port, target).await {
+                            tracing::warn!("UDP listener :{port} (re-enable): {e:#}");
+                        }
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if let Ok(tid) = Uuid::parse_str(&rule.tunnel_id) {
+        let version = *state.config_version.read().await;
+        if let Ok(rules) = state.db.rules_for_tunnel(&rule.tunnel_id).await {
+            state.agents.broadcast_config(
+                &tid,
+                crate::protocol::ConfigUpdate { version, rules },
+            );
+        }
+    }
+    Redirect::to(&format!("/tunnels/{}", rule.tunnel_id)).into_response()
 }
 
 async fn delete_rule(State(state): State<Arc<EdgeState>>, Path(id): Path<String>,
