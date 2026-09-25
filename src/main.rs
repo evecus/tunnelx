@@ -65,6 +65,9 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // rustls 0.23 requires an explicit process-level CryptoProvider
+    common::install_crypto_provider();
+
     tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
             "tunnelx=info,quinn=warn,sqlx=warn".into()

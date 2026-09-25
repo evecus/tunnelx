@@ -6,6 +6,11 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
+/// Install the ring CryptoProvider once (required by rustls 0.23).
+pub fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Load or generate a self-signed certificate for the QUIC endpoint.
 pub fn load_or_generate_quic_cert(
     cert_path: &Path,
@@ -49,6 +54,7 @@ pub fn make_quic_server_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
 ) -> Result<quinn::ServerConfig> {
+    install_crypto_provider();
     let mut server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)?;
@@ -67,6 +73,7 @@ pub fn make_quic_server_config(
 }
 
 pub fn make_quic_client_config() -> Result<quinn::ClientConfig> {
+    install_crypto_provider();
     let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
@@ -138,7 +145,7 @@ pub fn load_https_server_config(
         .context("parse private key PEM")?
         .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path.display()))?;
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    install_crypto_provider();
 
     let mut config = rustls::ServerConfig::builder()
         .with_no_client_auth()
