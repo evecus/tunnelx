@@ -3,22 +3,17 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use http_body_util::Full;
 use hyper::body::Incoming;
-use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::EdgeState;
 use crate::protocol::{DataStreamHeader, DataStreamType};
-
-pub struct AgentPool {
-    inner: DashMap<Uuid, Vec<AgentHandle>>,
-}
 
 #[derive(Clone)]
 pub struct AgentHandle {
@@ -26,6 +21,7 @@ pub struct AgentHandle {
     #[allow(dead_code)]
     pub agent_name: String,
     pub open_stream: mpsc::UnboundedSender<OpenStreamReq>,
+    pub config_tx: mpsc::UnboundedSender<crate::protocol::ConfigUpdate>,
 }
 
 pub struct OpenStreamReq {
@@ -35,6 +31,10 @@ pub struct OpenStreamReq {
     pub http_req: Option<Request<Incoming>>,
     pub udp_to_agent: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
     pub udp_from_agent: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+}
+
+pub struct AgentPool {
+    inner: DashMap<Uuid, Vec<AgentHandle>>,
 }
 
 impl AgentPool {
@@ -68,6 +68,22 @@ impl AgentPool {
     pub fn count(&self, tunnel_id: &Uuid) -> usize {
         self.inner.get(tunnel_id).map(|l| l.len()).unwrap_or(0)
     }
+
+    pub fn broadcast_config(&self, tunnel_id: &Uuid, cfg: crate::protocol::ConfigUpdate) {
+        if let Some(list) = self.inner.get(tunnel_id) {
+            for h in list.iter() {
+                if h.config_tx.send(cfg.clone()).is_err() {
+                    tracing::warn!("failed to push config to agent {}", h.agent_id);
+                }
+            }
+            tracing::info!(
+                "pushed config v{} ({} rules) to {} agent(s) for tunnel {tunnel_id}",
+                cfg.version,
+                cfg.rules.len(),
+                list.len()
+            );
+        }
+    }
 }
 
 pub async fn run_http_listener(state: Arc<EdgeState>, tls: bool) -> Result<()> {
@@ -98,52 +114,59 @@ pub async fn run_http_listener(state: Arc<EdgeState>, tls: bool) -> Result<()> {
         tokio::spawn(async move {
             let result = async {
                 if let Some(acceptor) = tls_acceptor {
-                    let tls_stream = acceptor.accept(stream).await
-                        .map_err(|e| anyhow!("TLS handshake from {peer}: {e}"))?;
-                    serve_http1(state, tls_stream, peer).await
+                    let tls_stream = acceptor.accept(stream).await.context("tls accept")?;
+                    serve_http(state, TokioIo::new(tls_stream)).await
                 } else {
-                    serve_http1(state, stream, peer).await
+                    serve_http(state, TokioIo::new(stream)).await
                 }
-            }.await;
-            if let Err(e) = result {
-                debug!("HTTP(S) connection from {peer}: {e:#}");
+            };
+            if let Err(e) = result.await {
+                debug!("http conn from {peer}: {e:#}");
             }
         });
     }
 }
 
-async fn serve_http1<S>(state: Arc<EdgeState>, stream: S, peer: SocketAddr) -> Result<()>
+async fn serve_http<S>(state: Arc<EdgeState>, io: TokioIo<S>) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let io = TokioIo::new(stream);
-    let service = service_fn(move |req| {
+    let service = hyper::service::service_fn(move |req| {
         let state = state.clone();
         async move { handle_http_request(state, req).await }
     });
     hyper::server::conn::http1::Builder::new()
         .serve_connection(io, service)
         .await
-        .map_err(|e| anyhow!("HTTP conn from {peer}: {e}"))
+        .context("http1 serve")?;
+    Ok(())
 }
 
 async fn handle_http_request(
     state: Arc<EdgeState>,
     req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
-    let host = req.headers().get("host").and_then(|v| v.to_str().ok()).unwrap_or("")
-        .split(':').next().unwrap_or("").to_string();
+) -> Result<Response<Full<Bytes>>> {
+    let host = req
+        .headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .to_string();
 
     if host.is_empty() {
         return Ok(simple_response(StatusCode::BAD_REQUEST, "missing Host header"));
     }
 
-    let rule = match state.db.find_http_rule(&host).await {
-        Ok(Some(r)) => r,
-        Ok(None) => return Ok(simple_response(StatusCode::NOT_FOUND, format!("no tunnel for host {host}"))),
-        Err(e) => {
-            error!("db error: {e:#}");
-            return Ok(simple_response(StatusCode::INTERNAL_SERVER_ERROR, "db error"));
+    let rule = match state.db.find_http_rule(&host).await? {
+        Some(r) => r,
+        None => {
+            return Ok(simple_response(
+                StatusCode::NOT_FOUND,
+                format!("no HTTP rule for host '{host}'"),
+            ));
         }
     };
 
@@ -164,7 +187,11 @@ async fn handle_http_request(
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     let open = OpenStreamReq {
-        header: DataStreamHeader { rule_id, stream_type: DataStreamType::Http },
+        header: DataStreamHeader {
+            rule_id,
+            stream_type: DataStreamType::Http,
+            target: rule.target.clone(),
+        },
         public_tcp: None,
         http_tx: Some(tx),
         http_req: Some(req),
@@ -205,7 +232,7 @@ pub async fn run_tcp_listener(
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_tcp_connection(state, rule_id, public_stream, peer).await {
-                debug!("TCP proxy error from {peer}: {e:#}");
+                warn!("TCP proxy error from {peer}: {e:#}");
             }
         });
     }
@@ -218,13 +245,27 @@ async fn handle_tcp_connection(
     _peer: SocketAddr,
 ) -> Result<()> {
     let rules = state.db.list_all_tcp_rules().await?;
-    let rule = rules.into_iter().find(|r| r.id == rule_id.to_string())
+    let rule = rules
+        .into_iter()
+        .find(|r| r.id == rule_id.to_string())
         .ok_or_else(|| anyhow!("rule gone"))?;
     let tunnel_id = Uuid::parse_str(&rule.tunnel_id)?;
-    let agent = state.agents.pick(&tunnel_id).ok_or_else(|| anyhow!("no agent online"))?;
+    let agent = state
+        .agents
+        .pick(&tunnel_id)
+        .ok_or_else(|| anyhow!("no agent online for tunnel {tunnel_id}"))?;
+    info!(
+        "TCP peer -> agent {} rule {rule_id} target {}",
+        agent.agent_id,
+        rule.target
+    );
 
     let open = OpenStreamReq {
-        header: DataStreamHeader { rule_id, stream_type: DataStreamType::Tcp },
+        header: DataStreamHeader {
+            rule_id,
+            stream_type: DataStreamType::Tcp,
+            target: rule.target.clone(),
+        },
         public_tcp: Some(public_stream),
         http_tx: None,
         http_req: None,
@@ -232,12 +273,13 @@ async fn handle_tcp_connection(
         udp_from_agent: None,
     };
 
-    agent.open_stream.send(open).map_err(|_| anyhow!("agent disconnected"))?;
+    agent
+        .open_stream
+        .send(open)
+        .map_err(|_| anyhow!("agent disconnected"))?;
     Ok(())
 }
 
-/// Bind a public UDP port and forward datagrams through an Agent.
-/// One QUIC data stream per remote client address (idle timeout 60s).
 pub async fn run_udp_listener(
     state: Arc<EdgeState>,
     rule_id: Uuid,
@@ -248,63 +290,66 @@ pub async fn run_udp_listener(
     use tokio::time::{timeout, Duration};
 
     let addr = SocketAddr::from(([0, 0, 0, 0], public_port));
-    let socket = tokio::net::UdpSocket::bind(addr).await.context("bind udp")?;
-    let socket = Arc::new(socket);
+    let sock = Arc::new(tokio::net::UdpSocket::bind(addr).await.context("bind udp")?);
     info!("UDP listener on :{public_port} for rule {rule_id}");
 
-    let sessions: Arc<tokio::sync::Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>> =
-        Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+    let rules = state.db.list_all_udp_rules().await?;
+    let rule = rules
+        .into_iter()
+        .find(|r| r.id == rule_id.to_string())
+        .ok_or_else(|| anyhow!("rule gone"))?;
+    let tunnel_id = Uuid::parse_str(&rule.tunnel_id)?;
+    let target = rule.target.clone();
 
+    let mut sessions: HashMap<SocketAddr, tokio::sync::mpsc::Sender<Vec<u8>>> = HashMap::new();
     let mut buf = vec![0u8; 65535];
-    loop {
-        let (n, client_addr) = socket.recv_from(&mut buf).await?;
-        let packet = buf[..n].to_vec();
 
-        {
-            let map = sessions.lock().await;
-            if let Some(tx) = map.get(&client_addr) {
-                let _ = tx.try_send(packet);
-                continue;
+    loop {
+        let (n, peer) = sock.recv_from(&mut buf).await?;
+        let pkt = buf[..n].to_vec();
+
+        if let Some(tx) = sessions.get(&peer) {
+            if tx.send(pkt).await.is_err() {
+                sessions.remove(&peer);
             }
+            continue;
         }
 
-        let rules = state.db.list_all_udp_rules().await?;
-        let rule = rules.into_iter().find(|r| r.id == rule_id.to_string())
-            .ok_or_else(|| anyhow!("rule gone"))?;
-        let tunnel_id = Uuid::parse_str(&rule.tunnel_id)?;
         let agent = match state.agents.pick(&tunnel_id) {
             Some(a) => a,
-            None => continue,
+            None => {
+                warn!("UDP no agent for tunnel {tunnel_id}");
+                continue;
+            }
         };
 
         let (to_agent_tx, to_agent_rx) = mpsc::channel::<Vec<u8>>(64);
         let (from_agent_tx, mut from_agent_rx) = mpsc::channel::<Vec<u8>>(64);
-        let _ = to_agent_tx.try_send(packet);
-
-        sessions.lock().await.insert(client_addr, to_agent_tx);
+        let _ = to_agent_tx.send(pkt).await;
 
         let open = OpenStreamReq {
-            header: DataStreamHeader { rule_id, stream_type: DataStreamType::Udp },
+            header: DataStreamHeader {
+                rule_id,
+                stream_type: DataStreamType::Udp,
+                target: target.clone(),
+            },
             public_tcp: None,
             http_tx: None,
             http_req: None,
             udp_to_agent: Some(to_agent_rx),
             udp_from_agent: Some(from_agent_tx),
         };
-
         if agent.open_stream.send(open).is_err() {
-            sessions.lock().await.remove(&client_addr);
+            warn!("UDP agent disconnected");
             continue;
         }
+        sessions.insert(peer, to_agent_tx);
 
-        let socket2 = socket.clone();
-        let sessions2 = sessions.clone();
+        let sock2 = sock.clone();
         tokio::spawn(async move {
             while let Ok(Some(pkt)) = timeout(Duration::from_secs(60), from_agent_rx.recv()).await {
-                let _ = socket2.send_to(&pkt, client_addr).await;
+                let _ = sock2.send_to(&pkt, peer).await;
             }
-            sessions2.lock().await.remove(&client_addr);
-            debug!("UDP session {client_addr} closed");
         });
     }
 }
