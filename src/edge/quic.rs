@@ -139,29 +139,59 @@ async fn handle_agent_connection(state: Arc<EdgeState>, conn: quinn::Connection)
     });
     send.write_all(&encode_message(&resp)?).await?;
     info!("Agent {} ({}) registered for tunnel {} ({})", reg.agent_name, reg.agent_id, tunnel.name, tunnel_id);
+
     let (tx, mut rx) = mpsc::unbounded_channel::<OpenStreamReq>();
-    state.agents.register(tunnel_id, AgentHandle { agent_id: reg.agent_id, agent_name: reg.agent_name.clone(), open_stream: tx });
+    let (cfg_tx, mut cfg_rx) = mpsc::unbounded_channel::<ConfigUpdate>();
+    state.agents.register(
+        tunnel_id,
+        AgentHandle {
+            agent_id: reg.agent_id,
+            agent_name: reg.agent_name.clone(),
+            open_stream: tx,
+            config_tx: cfg_tx,
+        },
+    );
     let conn2 = conn.clone();
     let open_task = tokio::spawn(async move {
         while let Some(req) = rx.recv().await {
             let conn = conn2.clone();
-            tokio::spawn(async move { if let Err(e) = open_data_stream(conn, req).await { error!("open data stream: {e:#}"); } });
+            tokio::spawn(async move {
+                if let Err(e) = open_data_stream(conn, req).await {
+                    error!("open data stream: {e:#}");
+                }
+            });
         }
     });
     let mut ctrl_buf = Vec::new();
     loop {
-        match recv.read_chunk(8192, true).await {
-            Ok(Some(chunk)) => {
-                ctrl_buf.extend_from_slice(&chunk.bytes);
-                while let Ok(Some((msg, consumed))) = try_decode_message(&ctrl_buf) {
-                    ctrl_buf.drain(..consumed);
-                    if matches!(msg, ControlMessage::Ping) {
-                        send.write_all(&encode_message(&ControlMessage::Pong)?).await?;
+        tokio::select! {
+            cfg = cfg_rx.recv() => {
+                match cfg {
+                    Some(cfg) => {
+                        info!("pushing config v{} to agent {}", cfg.version, reg.agent_id);
+                        if let Err(e) = send.write_all(&encode_message(&ControlMessage::ConfigUpdate(cfg))?).await {
+                            warn!("failed to write ConfigUpdate: {e}");
+                            break;
+                        }
                     }
+                    None => break,
                 }
             }
-            Ok(None) => break,
-            Err(e) => { warn!("control stream error: {e}"); break; }
+            chunk = recv.read_chunk(8192, true) => {
+                match chunk {
+                    Ok(Some(chunk)) => {
+                        ctrl_buf.extend_from_slice(&chunk.bytes);
+                        while let Ok(Some((msg, consumed))) = try_decode_message(&ctrl_buf) {
+                            ctrl_buf.drain(..consumed);
+                            if matches!(msg, ControlMessage::Ping) {
+                                send.write_all(&encode_message(&ControlMessage::Pong)?).await?;
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => { warn!("control stream error: {e}"); break; }
+                }
+            }
         }
     }
     state.agents.unregister(tunnel_id, reg.agent_id);
