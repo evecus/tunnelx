@@ -1,13 +1,13 @@
 //! Wire protocol between Edge and Agent over QUIC.
 //!
-//! - Stream 0 is the control channel (bi-directional).
-//! - Subsequent bi-directional streams are data channels (HTTP / TCP / UDP).
+//! - First bi-stream is the control channel.
+//! - Subsequent bi-streams are data channels (HTTP / TCP / UDP).
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Externally tagged enum — works reliably with bincode.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", content = "payload")]
 pub enum ControlMessage {
     Register(RegisterRequest),
     RegisterResponse(RegisterResponse),
