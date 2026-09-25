@@ -66,7 +66,8 @@ pub fn make_quic_server_config(
     server_config.transport = Arc::new({
         let mut t = quinn::TransportConfig::default();
         t.max_concurrent_bidi_streams(1024u32.into());
-        t.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
+        t.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+        t.max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into().unwrap()));
         t
     });
     Ok(server_config)
@@ -80,9 +81,16 @@ pub fn make_quic_client_config() -> Result<quinn::ClientConfig> {
         .with_no_client_auth();
     crypto.alpn_protocols = vec![b"tunnelx".to_vec()];
 
-    let client_config = quinn::ClientConfig::new(Arc::new(
+    let mut client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
     ));
+    client_config.transport_config(Arc::new({
+        let mut t = quinn::TransportConfig::default();
+        // Keep the path alive behind NAT / middleboxes
+        t.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
+        t.max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into().unwrap()));
+        t
+    }));
     Ok(client_config)
 }
 
