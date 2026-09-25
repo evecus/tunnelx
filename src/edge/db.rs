@@ -79,7 +79,6 @@ impl Db {
         .execute(&self.pool)
         .await?;
 
-        // Upgrade older DBs that were created before some columns existed.
         self.ensure_column("ingress_rules", "created_at", "TEXT NOT NULL DEFAULT ''")
             .await?;
         self.ensure_column("ingress_rules", "path_prefix", "TEXT")
@@ -207,6 +206,23 @@ impl Db {
 
     pub async fn delete_rule(&self, id: &str) -> Result<()> {
         sqlx::query("DELETE FROM ingress_rules WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_rule(&self, id: &str) -> Result<Option<IngressRuleRow>> {
+        let row = sqlx::query_as::<_, IngressRuleRow>("SELECT * FROM ingress_rules WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row)
+    }
+
+    pub async fn set_rule_enabled(&self, id: &str, enabled: bool) -> Result<()> {
+        sqlx::query("UPDATE ingress_rules SET enabled = ? WHERE id = ?")
+            .bind(if enabled { 1i64 } else { 0i64 })
             .bind(id)
             .execute(&self.pool)
             .await?;
