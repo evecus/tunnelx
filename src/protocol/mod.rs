@@ -70,6 +70,9 @@ pub struct AgentStatus {
 pub struct DataStreamHeader {
     pub rule_id: Uuid,
     pub stream_type: DataStreamType,
+    /// Local service target (e.g. 127.0.0.1:22). Agent prefers this if present.
+    #[serde(default)]
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
