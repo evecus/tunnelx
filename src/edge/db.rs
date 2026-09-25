@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::Row;
 use std::path::Path;
 use uuid::Uuid;
 
@@ -68,7 +69,7 @@ impl Db {
                 target TEXT NOT NULL,
                 public_port INTEGER,
                 enabled INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS idx_rules_tunnel ON ingress_rules(tunnel_id);
             CREATE INDEX IF NOT EXISTS idx_rules_hostname ON ingress_rules(hostname);
@@ -76,6 +77,36 @@ impl Db {
         )
         .execute(&self.pool)
         .await?;
+
+        // Upgrade older DBs that were created before some columns existed.
+        self.ensure_column("ingress_rules", "created_at", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+        self.ensure_column("ingress_rules", "path_prefix", "TEXT")
+            .await?;
+        self.ensure_column("ingress_rules", "public_port", "INTEGER")
+            .await?;
+        self.ensure_column("ingress_rules", "enabled", "INTEGER NOT NULL DEFAULT 1")
+            .await?;
+        self.ensure_column("tunnels", "created_at", "TEXT NOT NULL DEFAULT ''")
+            .await?;
+
+        Ok(())
+    }
+
+    async fn ensure_column(&self, table: &str, column: &str, col_def: &str) -> Result<()> {
+        let rows = sqlx::query(&format!("PRAGMA table_info({table})"))
+            .fetch_all(&self.pool)
+            .await?;
+        let exists = rows.iter().any(|r| {
+            let name: String = r.get("name");
+            name == column
+        });
+        if !exists {
+            tracing::info!("db migrate: adding {table}.{column}");
+            sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {column} {col_def}"))
+                .execute(&self.pool)
+                .await?;
+        }
         Ok(())
     }
 
