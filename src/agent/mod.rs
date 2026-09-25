@@ -55,7 +55,6 @@ async fn connect_and_run(state: Arc<AgentState>) -> Result<()> {
         agent_name: state.config.name.clone(), version: env!("CARGO_PKG_VERSION").to_string(),
     });
     send.write_all(&encode_message(&reg)?).await?;
-    // Read length-prefixed RegisterResponse
     let mut len_buf = [0u8; 4];
     recv.read_exact(&mut len_buf).await.context("read register response len")?;
     let len = u32::from_be_bytes(len_buf) as usize;
@@ -71,7 +70,6 @@ async fn connect_and_run(state: Arc<AgentState>) -> Result<()> {
         _ => return Err(anyhow!("unexpected response")),
     }
 
-    // Keep Connection + Endpoint alive for the whole session
     let _conn_keep = conn.clone();
     let conn2 = conn.clone();
     let state2 = state.clone();
@@ -86,10 +84,9 @@ async fn connect_and_run(state: Arc<AgentState>) -> Result<()> {
         }
     });
 
-    // Application-level keepalive on the control stream
     let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(15));
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    ping_interval.tick().await; // consume immediate first tick
+    ping_interval.tick().await;
 
     info!("session up, holding control channel");
     let mut ctrl_buf = Vec::new();
@@ -149,12 +146,18 @@ async fn handle_data_stream(state: Arc<AgentState>, mut send: quinn::SendStream,
     recv.read_exact(&mut hdr_buf).await?;
     let header: DataStreamHeader = bincode::deserialize(&hdr_buf)?;
     let rules = state.rules.read().await;
-    let rule = rules.iter().find(|r| r.id == header.rule_id).cloned()
-        .ok_or_else(|| anyhow!("unknown rule {}", header.rule_id))?;
+    let rule = rules.iter().find(|r| r.id == header.rule_id).cloned();
     drop(rules);
+    let target_str = if !header.target.is_empty() {
+        header.target.clone()
+    } else if let Some(ref r) = rule {
+        r.target.clone()
+    } else {
+        anyhow::bail!("unknown rule {} and no target in header", header.rule_id);
+    };
     match header.stream_type {
         DataStreamType::Tcp => {
-            let target = parse_target(&rule.target)?;
+            let target = parse_target(&target_str)?;
             let local = tokio::net::TcpStream::connect(&target).await
                 .with_context(|| format!("connect to {target}"))?;
             info!("TCP proxy {} <-> {}", header.rule_id, target);
@@ -181,7 +184,7 @@ async fn handle_data_stream(state: Arc<AgentState>, mut send: quinn::SendStream,
             let _ = tokio::join!(t1, t2);
         }
         DataStreamType::Udp => {
-            let target = parse_target(&rule.target)?;
+            let target = parse_target(&target_str)?;
             let sock = tokio::net::UdpSocket::bind("0.0.0.0:0").await.context("bind local udp")?;
             sock.connect(&target).await.with_context(|| format!("connect udp to {target}"))?;
             info!("UDP proxy {} <-> {}", header.rule_id, target);
@@ -224,7 +227,7 @@ async fn handle_data_stream(state: Arc<AgentState>, mut send: quinn::SendStream,
             #[derive(serde::Deserialize)]
             struct HttpReqWire { method: String, uri: String, headers: Vec<(String, String)>, body: Vec<u8> }
             let req_wire: HttpReqWire = bincode::deserialize(&req_buf)?;
-            let base = rule.target.trim_end_matches('/');
+            let base = target_str.trim_end_matches('/');
             let path = if req_wire.uri.starts_with("http") {
                 url::Url::parse(&req_wire.uri).map(|u| {
                     let mut p = u.path().to_string();
