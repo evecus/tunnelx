@@ -13,7 +13,7 @@ use tracing::info;
 
 pub use config::{load_edge_config, CliOverrides};
 pub use db::Db;
-pub use routing::AgentPool;
+pub use routing::{AgentPool, ListenerRegistry};
 
 #[derive(Clone)]
 pub struct EdgeConfig {
@@ -36,6 +36,7 @@ pub struct EdgeState {
     pub config: EdgeConfig,
     pub db: Db,
     pub agents: AgentPool,
+    pub listeners: ListenerRegistry,
     pub config_version: RwLock<u64>,
 }
 
@@ -51,6 +52,7 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
         config: config.clone(),
         db,
         agents: AgentPool::new(),
+        listeners: ListenerRegistry::new(),
         config_version: RwLock::new(1),
     });
 
@@ -104,18 +106,16 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
         let rules = state.db.list_all_tcp_rules().await?;
         for rule in rules {
             if let Some(port) = rule.public_port {
-                let st = state.clone();
                 let rule_id = match uuid::Uuid::parse_str(&rule.id) {
                     Ok(id) => id,
                     Err(_) => continue,
                 };
-                let port = port as u16;
-                let target = rule.target.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = routing::run_tcp_listener(st, rule_id, port, target).await {
-                        tracing::error!("TCP listener :{port} error: {e:#}");
-                    }
-                });
+                state.listeners.start_tcp(
+                    state.clone(),
+                    rule_id,
+                    port as u16,
+                    rule.target.clone(),
+                );
             }
         }
     }
@@ -124,18 +124,16 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
         let rules = state.db.list_all_udp_rules().await?;
         for rule in rules {
             if let Some(port) = rule.public_port {
-                let st = state.clone();
                 let rule_id = match uuid::Uuid::parse_str(&rule.id) {
                     Ok(id) => id,
                     Err(_) => continue,
                 };
-                let port = port as u16;
-                let target = rule.target.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = routing::run_udp_listener(st, rule_id, port, target).await {
-                        tracing::error!("UDP listener :{port} error: {e:#}");
-                    }
-                });
+                state.listeners.start_udp(
+                    state.clone(),
+                    rule_id,
+                    port as u16,
+                    rule.target.clone(),
+                );
             }
         }
     }
