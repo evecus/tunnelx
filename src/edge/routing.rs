@@ -86,6 +86,53 @@ impl AgentPool {
     }
 }
 
+/// Tracks TCP/UDP public listeners so we can stop them and free ports.
+pub struct ListenerRegistry {
+    tcp: DashMap<Uuid, tokio::task::JoinHandle<()>>,
+    udp: DashMap<Uuid, tokio::task::JoinHandle<()>>,
+}
+
+impl ListenerRegistry {
+    pub fn new() -> Self {
+        Self {
+            tcp: DashMap::new(),
+            udp: DashMap::new(),
+        }
+    }
+
+    /// Abort any existing TCP/UDP listener for this rule (releases the public port).
+    pub fn stop(&self, rule_id: Uuid) {
+        if let Some((_, h)) = self.tcp.remove(&rule_id) {
+            h.abort();
+            tracing::info!("stopped TCP listener for rule {rule_id}");
+        }
+        if let Some((_, h)) = self.udp.remove(&rule_id) {
+            h.abort();
+            tracing::info!("stopped UDP listener for rule {rule_id}");
+        }
+    }
+
+    pub fn start_tcp(&self, state: Arc<EdgeState>, rule_id: Uuid, port: u16, target: String) {
+        self.stop(rule_id);
+        let handle = tokio::spawn(async move {
+            if let Err(e) = run_tcp_listener(state, rule_id, port, target).await {
+                tracing::error!("TCP listener :{port} rule {rule_id}: {e:#}");
+            }
+        });
+        self.tcp.insert(rule_id, handle);
+    }
+
+    pub fn start_udp(&self, state: Arc<EdgeState>, rule_id: Uuid, port: u16, target: String) {
+        self.stop(rule_id);
+        let handle = tokio::spawn(async move {
+            if let Err(e) = run_udp_listener(state, rule_id, port, target).await {
+                tracing::error!("UDP listener :{port} rule {rule_id}: {e:#}");
+            }
+        });
+        self.udp.insert(rule_id, handle);
+    }
+}
+
 pub async fn run_http_listener(state: Arc<EdgeState>, tls: bool) -> Result<()> {
     let addr = if tls { state.config.https_addr } else { state.config.http_addr };
 
