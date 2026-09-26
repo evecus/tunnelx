@@ -33,8 +33,9 @@ pub struct OpenStreamReq {
     pub udp_from_agent: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
 }
 
+/// One online Agent per tunnel. A second connection with the same token is rejected.
 pub struct AgentPool {
-    inner: DashMap<Uuid, Vec<AgentHandle>>,
+    inner: DashMap<Uuid, AgentHandle>,
 }
 
 impl AgentPool {
@@ -42,46 +43,65 @@ impl AgentPool {
         Self { inner: DashMap::new() }
     }
 
-    pub fn register(&self, tunnel_id: Uuid, handle: AgentHandle) {
-        self.inner.entry(tunnel_id).or_default().push(handle);
-        info!("Agent registered for tunnel {tunnel_id}");
+    /// Register the sole agent for `tunnel_id`. Returns `false` if one is already online.
+    pub fn try_register(&self, tunnel_id: Uuid, handle: AgentHandle) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.inner.entry(tunnel_id) {
+            Entry::Occupied(existing) => {
+                tracing::warn!(
+                    "reject agent {} for tunnel {tunnel_id}: already held by {}",
+                    handle.agent_id,
+                    existing.get().agent_id
+                );
+                false
+            }
+            Entry::Vacant(slot) => {
+                info!(
+                    "Agent {} registered for tunnel {tunnel_id} (exclusive)",
+                    handle.agent_id
+                );
+                slot.insert(handle);
+                true
+            }
+        }
     }
 
     pub fn unregister(&self, tunnel_id: Uuid, agent_id: Uuid) {
-        if let Some(mut list) = self.inner.get_mut(&tunnel_id) {
-            list.retain(|h| h.agent_id != agent_id);
+        let remove = self
+            .inner
+            .get(&tunnel_id)
+            .map(|h| h.agent_id == agent_id)
+            .unwrap_or(false);
+        if remove {
+            self.inner.remove(&tunnel_id);
+            info!("Agent {agent_id} unregistered from tunnel {tunnel_id}");
         }
-        info!("Agent {agent_id} unregistered from tunnel {tunnel_id}");
     }
 
     pub fn pick(&self, tunnel_id: &Uuid) -> Option<AgentHandle> {
-        self.inner.get(tunnel_id).and_then(|list| {
-            if list.is_empty() {
-                None
-            } else {
-                let idx = rand::random::<usize>() % list.len();
-                list.get(idx).cloned()
-            }
-        })
+        self.inner.get(tunnel_id).map(|h| h.clone())
     }
 
     pub fn count(&self, tunnel_id: &Uuid) -> usize {
-        self.inner.get(tunnel_id).map(|l| l.len()).unwrap_or(0)
+        if self.inner.contains_key(tunnel_id) {
+            1
+        } else {
+            0
+        }
     }
 
     pub fn broadcast_config(&self, tunnel_id: &Uuid, cfg: crate::protocol::ConfigUpdate) {
-        if let Some(list) = self.inner.get(tunnel_id) {
-            for h in list.iter() {
-                if h.config_tx.send(cfg.clone()).is_err() {
-                    tracing::warn!("failed to push config to agent {}", h.agent_id);
-                }
+        if let Some(h) = self.inner.get(tunnel_id) {
+            if h.config_tx.send(cfg.clone()).is_err() {
+                tracing::warn!("failed to push config to agent {}", h.agent_id);
+            } else {
+                tracing::info!(
+                    "pushed config v{} ({} rules) to agent {} for tunnel {tunnel_id}",
+                    cfg.version,
+                    cfg.rules.len(),
+                    h.agent_id
+                );
             }
-            tracing::info!(
-                "pushed config v{} ({} rules) to {} agent(s) for tunnel {tunnel_id}",
-                cfg.version,
-                cfg.rules.len(),
-                list.len()
-            );
         }
     }
 }
