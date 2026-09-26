@@ -61,7 +61,6 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // rustls 0.23 requires an explicit process-level CryptoProvider
     common::install_crypto_provider();
 
     tracing_subscriber::registry()
@@ -109,5 +108,14 @@ async fn main() -> Result<()> {
             })
             .await
         }
+    }
+}
+
+mod hostname {
+    use std::ffi::OsString;
+    pub fn get() -> Result<OsString, ()> {
+        std::env::var_os("HOSTNAME")
+            .or_else(|| std::env::var_os("COMPUTERNAME"))
+            .ok_or(())
     }
 }

@@ -21,7 +21,6 @@ pub struct EdgeConfig {
     pub quic_addr: SocketAddr,
     pub panel_addr: SocketAddr,
     pub http_addr: SocketAddr,
-    pub https_addr: SocketAddr,
     pub panel_user: String,
     pub panel_pass: String,
     pub quic_cert: PathBuf,
@@ -62,8 +61,11 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
     info!("  data_dir   = {}", config.data_dir.display());
     info!("  QUIC       = UDP {}", config.quic_addr);
     info!("  panel      = http://{}", config.panel_addr);
-    info!("  HTTP       = {}", config.http_addr);
-    info!("  HTTPS      = {} (enabled={})", config.https_addr, config.https_enabled);
+    info!(
+        "  public HTTP(S) = {} (https_enabled={})",
+        config.http_addr,
+        config.https_enabled
+    );
 
     let quic_state = state.clone();
     let quic_addr = config.quic_addr;
@@ -85,21 +87,21 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
         }
     }
 
-    // Public HTTP(S) front for Host-based rules:
+    // Single public front port (`listen.http`):
     // - https_enabled + port 443 → TLS on 443 + redirect-only on :80
-    // - https_enabled + other port → only that HTTPS port (no extra HTTP)
-    // - https disabled → plain HTTP on http_addr
+    // - https_enabled + other port → TLS only on that port
+    // - https disabled → plain HTTP on that port
     if state.config.https_enabled {
+        let port = state.config.http_addr.port();
         let https_state = state.clone();
-        let https_port = state.config.https_addr.port();
         tokio::spawn(async move {
             if let Err(e) = routing::run_http_listener(https_state, true).await {
                 tracing::warn!("HTTPS listener not started: {e:#}");
             }
         });
 
-        if https_port == 443 {
-            let redir_addr = std::net::SocketAddr::new(state.config.https_addr.ip(), 80);
+        if port == 443 {
+            let redir_addr = std::net::SocketAddr::new(state.config.http_addr.ip(), 80);
             let http_state = state.clone();
             tokio::spawn(async move {
                 if let Err(e) = routing::run_http_redirect_listener(http_state, redir_addr).await {
@@ -109,8 +111,8 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
             info!("HTTPS on :443 → also binding {redir_addr} for HTTP→HTTPS redirect");
         } else {
             info!(
-                "HTTPS on non-443 port {} → only occupying that port (no :80 redirect listener)",
-                https_port
+                "HTTPS on non-443 port {} → only occupying that port (no :80 redirect)",
+                port
             );
         }
     } else {
