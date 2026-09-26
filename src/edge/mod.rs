@@ -88,7 +88,7 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
     }
 
     // Single public front port (`listen.http`):
-    // - https_enabled + port 443 → TLS on 443 + redirect-only on :80
+    // - https_enabled + port 443 → TLS on 443 + optional :80 redirect
     // - https_enabled + other port → TLS only on that port
     // - https disabled → plain HTTP on that port
     if state.config.https_enabled {
@@ -101,14 +101,13 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
         });
 
         if port == 443 {
+            // :80 is optional — try bind; if taken, Edge still starts.
             let redir_addr = std::net::SocketAddr::new(state.config.http_addr.ip(), 80);
             let http_state = state.clone();
             tokio::spawn(async move {
-                if let Err(e) = routing::run_http_redirect_listener(http_state, redir_addr).await {
-                    tracing::warn!("HTTP→HTTPS redirect on {redir_addr} failed: {e:#}");
-                }
+                routing::run_http_redirect_listener(http_state, redir_addr).await;
             });
-            info!("HTTPS on :443 → also binding {redir_addr} for HTTP→HTTPS redirect");
+            info!("HTTPS on :443 → will try optional HTTP→HTTPS redirect on {redir_addr}");
         } else {
             info!(
                 "HTTPS on non-443 port {} → only occupying that port (no :80 redirect)",
