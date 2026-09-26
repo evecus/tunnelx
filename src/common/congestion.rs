@@ -8,10 +8,10 @@
 
 use std::any::Any;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
 use brutal_core::{BrutalConfigCore, BrutalCore};
+use quinn_proto::RttEstimator;
 
 /// Selected QUIC congestion control algorithm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +43,9 @@ impl Congestion {
     }
 
     /// Build the quinn controller factory for this algorithm.
-    pub fn controller_factory(self) -> Arc<dyn quinn::congestion::ControllerFactory> {
+    pub fn controller_factory(
+        self,
+    ) -> Arc<dyn quinn::congestion::ControllerFactory + Send + Sync> {
         match self {
             Self::Bbr => Arc::new(quinn::congestion::BbrConfig::default()),
             Self::Cubic => Arc::new(quinn::congestion::CubicConfig::default()),
@@ -66,7 +68,7 @@ struct BrutalFactory {
 impl quinn::congestion::ControllerFactory for BrutalFactory {
     fn build(
         self: Arc<Self>,
-        now: Instant,
+        now: std::time::Instant,
         current_mtu: u16,
     ) -> Box<dyn quinn::congestion::Controller> {
         let config = BrutalConfigCore {
@@ -85,27 +87,35 @@ struct BrutalController {
 }
 
 impl quinn::congestion::Controller for BrutalController {
-    fn on_sent(&mut self, _now: Instant, bytes: usize, _last_packet_number: u64) {
-        self.core.on_sent(bytes as u64);
+    fn on_sent(&mut self, _now: std::time::Instant, bytes: u64, _last_packet_number: u64) {
+        self.core.on_sent(bytes);
     }
 
     fn on_ack(
         &mut self,
-        _now: Instant,
-        _sent: Instant,
-        bytes: usize,
+        _now: std::time::Instant,
+        _sent: std::time::Instant,
+        bytes: u64,
         _app_limited: bool,
-        rtt: Duration,
+        rtt: &RttEstimator,
     ) {
-        // Guard against degenerate RTT samples corrupting the smoothed estimate.
-        let rtt = if rtt.is_zero() { self.core.current_rtt() } else { rtt };
-        self.core.on_ack_bytes(bytes as u64, rtt);
+        self.core.on_ack_bytes(bytes, rtt.get());
+    }
+
+    fn on_end_acks(
+        &mut self,
+        now: std::time::Instant,
+        _in_flight: u64,
+        _app_limited: bool,
+        _largest_packet_num_acked: Option<u64>,
+    ) {
+        self.core.on_end_acks(now);
     }
 
     fn on_congestion_event(
         &mut self,
-        _now: Instant,
-        _sent: Instant,
+        _now: std::time::Instant,
+        _sent: std::time::Instant,
         _is_persistent_congestion: bool,
         lost_bytes: u64,
     ) {
@@ -113,33 +123,23 @@ impl quinn::congestion::Controller for BrutalController {
         self.core.on_loss_bytes(lost_bytes);
     }
 
-    fn on_pmtud_changed(&mut self, _old_mtu: u16, new_mtu: u16) {
+    fn on_mtu_update(&mut self, new_mtu: u16) {
         self.core.on_mtu_update(new_mtu);
-    }
-
-    fn on_end_acks(
-        &mut self,
-        _acks: quinn::congestion::AckState,
-        now: Instant,
-        _in_flight: usize,
-        _largest_acked: u64,
-    ) {
-        self.core.on_end_acks(now);
-    }
-
-    fn clone_boxed(&self) -> Box<dyn quinn::congestion::Controller> {
-        Box::new(self.clone())
-    }
-
-    fn into_any(self: Box<Self>) -> Box<dyn Any> {
-        self
-    }
-
-    fn current_mtu(&self) -> u16 {
-        self.core.mtu as u16
     }
 
     fn window(&self) -> u64 {
         self.core.window_cached()
+    }
+
+    fn clone_box(&self) -> Box<dyn quinn::congestion::Controller> {
+        Box::new(self.clone())
+    }
+
+    fn initial_window(&self) -> u64 {
+        self.core.initial_window()
+    }
+
+    fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
     }
 }
