@@ -82,9 +82,7 @@ impl PanelAuth {
     }
 
     fn is_locked(&self, ip: &str) -> Option<Duration> {
-        let Some(e) = self.failures.get(ip) else {
-            return None;
-        };
+        let e = self.failures.get(ip)?;
         if let Some(until) = e.locked_until {
             if Instant::now() < until {
                 return Some(until.saturating_duration_since(Instant::now()));
@@ -177,13 +175,14 @@ fn session_from_headers(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-fn require_auth(state: &EdgeState, headers: &HeaderMap) -> Result<(), Response> {
-    if let Some(token) = session_from_headers(headers) {
-        if state.panel_auth.validate(&token) {
-            return Ok(());
-        }
-    }
-    Err(Redirect::to("/login").into_response())
+fn is_authed(state: &EdgeState, headers: &HeaderMap) -> bool {
+    session_from_headers(headers)
+        .map(|token| state.panel_auth.validate(&token))
+        .unwrap_or(false)
+}
+
+fn redirect_login() -> Response {
+    Redirect::to("/login").into_response()
 }
 
 fn set_session_cookie(token: &str) -> String {
@@ -318,7 +317,7 @@ button.danger:hover { filter: brightness(1.1); }
 
 fn login_html(error: Option<&str>, locked_secs: Option<u64>) -> String {
     let err_block = if let Some(secs) = locked_secs {
-        let m = (secs + 59) / 60;
+        let m = secs.div_ceil(60);
         format!(
             r#"<div class="error">登录已锁定，请约 {m} 分钟后再试（连续失败过多）。</div>"#
         )
@@ -374,7 +373,7 @@ async fn login_page(
     headers: HeaderMap,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
 ) -> impl IntoResponse {
-    if require_auth(&state, &headers).is_ok() {
+    if is_authed(&state, &headers) {
         return Redirect::to("/tunnels").into_response();
     }
     let ip = client_ip(&headers, Some(ConnectInfo(addr)));
@@ -475,15 +474,15 @@ fn page(title: &str, body: &str) -> String {
 }
 
 async fn index(State(state): State<Arc<EdgeState>>, headers: HeaderMap) -> impl IntoResponse {
-    if require_auth(&state, &headers).is_err() {
-        return Redirect::to("/login").into_response();
+    if !is_authed(&state, &headers) {
+        return redirect_login();
     }
     Redirect::to("/tunnels").into_response()
 }
 
 async fn list_tunnels(State(state): State<Arc<EdgeState>>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(r) = require_auth(&state, &headers) {
-        return r;
+    if !is_authed(&state, &headers) {
+        return redirect_login();
     }
     let tunnels = state.db.list_tunnels().await.unwrap_or_default();
     let mut rows = String::new();
@@ -536,8 +535,8 @@ async fn create_tunnel(
     headers: HeaderMap,
     Form(form): Form<CreateTunnelForm>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_auth(&state, &headers) {
-        return r;
+    if !is_authed(&state, &headers) {
+        return redirect_login();
     }
     match state.db.create_tunnel(&form.name).await {
         Ok(t) => Redirect::to(&format!("/tunnels/{}", t.id)).into_response(),
@@ -550,8 +549,8 @@ async fn tunnel_detail(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(r) = require_auth(&state, &headers) {
-        return r;
+    if !is_authed(&state, &headers) {
+        return redirect_login();
     }
     let tunnel = match state.db.get_tunnel(&id).await {
         Ok(Some(t)) => t,
@@ -675,8 +674,8 @@ async fn add_rule(
     headers: HeaderMap,
     Form(form): Form<AddRuleForm>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_auth(&state, &headers) {
-        return r;
+    if !is_authed(&state, &headers) {
+        return redirect_login();
     }
     let st = match form.service_type.as_str() {
         "tcp" => ServiceType::Tcp,
@@ -735,8 +734,8 @@ async fn toggle_rule(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(r) = require_auth(&state, &headers) {
-        return r;
+    if !is_authed(&state, &headers) {
+        return redirect_login();
     }
     let rule = match state.db.get_rule(&id).await {
         Ok(Some(r)) => r,
@@ -784,8 +783,8 @@ async fn delete_rule(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(r) = require_auth(&state, &headers) {
-        return r;
+    if !is_authed(&state, &headers) {
+        return redirect_login();
     }
     if let Ok(Some(rule)) = state.db.get_rule(&id).await {
         if let Ok(rid) = Uuid::parse_str(&rule.id) {
@@ -814,8 +813,8 @@ async fn delete_tunnel(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(r) = require_auth(&state, &headers) {
-        return r;
+    if !is_authed(&state, &headers) {
+        return redirect_login();
     }
     if let Ok(rules) = state.db.list_rules(&id).await {
         for r in rules {
