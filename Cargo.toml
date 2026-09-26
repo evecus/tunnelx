@@ -18,7 +18,7 @@ path = "src/main.rs"
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 
-quinn = "0.11"
+quinn = "0.11.12"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pemfile = "2"
 tokio-rustls = "0.26"
@@ -55,6 +55,9 @@ hex = "0.4"
 url = "2"
 dashmap = "6"
 parking_lot = "0.12"
+
+# Brutal congestion control algorithm core (wrapped in src/common/congestion.rs)
+brutal-core = "0.1"
 
 [profile.release]
 lto = true
