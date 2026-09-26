@@ -85,22 +85,42 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
         }
     }
 
-    let http_state = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = routing::run_http_listener(http_state, false).await {
-            tracing::error!("HTTP listener error: {e:#}");
-        }
-    });
-
+    // Public HTTP(S) front for Host-based rules:
+    // - https_enabled + port 443 → TLS on 443 + redirect-only on :80
+    // - https_enabled + other port → only that HTTPS port (no extra HTTP)
+    // - https disabled → plain HTTP on http_addr
     if state.config.https_enabled {
         let https_state = state.clone();
+        let https_port = state.config.https_addr.port();
         tokio::spawn(async move {
             if let Err(e) = routing::run_http_listener(https_state, true).await {
                 tracing::warn!("HTTPS listener not started: {e:#}");
             }
         });
+
+        if https_port == 443 {
+            let redir_addr = std::net::SocketAddr::new(state.config.https_addr.ip(), 80);
+            let http_state = state.clone();
+            tokio::spawn(async move {
+                if let Err(e) = routing::run_http_redirect_listener(http_state, redir_addr).await {
+                    tracing::warn!("HTTP→HTTPS redirect on {redir_addr} failed: {e:#}");
+                }
+            });
+            info!("HTTPS on :443 → also binding {redir_addr} for HTTP→HTTPS redirect");
+        } else {
+            info!(
+                "HTTPS on non-443 port {} → only occupying that port (no :80 redirect listener)",
+                https_port
+            );
+        }
     } else {
-        info!("HTTPS disabled in config");
+        info!("HTTPS disabled; plain HTTP on {}", state.config.http_addr);
+        let http_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = routing::run_http_listener(http_state, false).await {
+                tracing::error!("HTTP listener error: {e:#}");
+            }
+        });
     }
 
     {
