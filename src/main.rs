@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[derive(Parser, Debug)]
-#[command(name = "tunnelx", version, about = "Self-hosted Cloudflare Tunnel alternative")]
+#[command(name = "tunnelx", version, about = "Cloudflare Tunnel-like reverse proxy over QUIC")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -33,10 +33,6 @@ enum Commands {
         /// Override config.toml listen.http
         #[arg(long)]
         http_addr: Option<String>,
-
-        /// Override config.toml listen.https
-        #[arg(long)]
-        https_addr: Option<String>,
 
         /// Override config.toml panel.user
         #[arg(long)]
@@ -83,7 +79,6 @@ async fn main() -> Result<()> {
             quic_addr,
             panel_addr,
             http_addr,
-            https_addr,
             panel_user,
             panel_pass,
         } => {
@@ -93,7 +88,6 @@ async fn main() -> Result<()> {
                     quic_addr,
                     panel_addr,
                     http_addr,
-                    https_addr,
                     panel_user,
                     panel_pass,
                 },
@@ -115,14 +109,5 @@ async fn main() -> Result<()> {
             })
             .await
         }
-    }
-}
-
-mod hostname {
-    use std::ffi::OsString;
-    pub fn get() -> Result<OsString, ()> {
-        std::env::var_os("HOSTNAME")
-            .or_else(|| std::env::var_os("COMPUTERNAME"))
-            .ok_or(())
     }
 }

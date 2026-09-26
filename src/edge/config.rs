@@ -20,10 +20,11 @@ pub struct ListenConfig {
     pub quic: String,
     /// Management panel HTTP address
     pub panel: String,
-    /// Public HTTP tunnel entry
+    /// Public HTTP/HTTPS front (one port). TLS if certs.https_enabled.
     pub http: String,
-    /// Public HTTPS tunnel entry
-    pub https: String,
+    /// Deprecated: ignored. Kept so old config.toml still loads.
+    #[serde(default, skip_serializing)]
+    pub https: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,7 +53,7 @@ impl Default for FileConfig {
                 quic: "0.0.0.0:7844".into(),
                 panel: "0.0.0.0:8080".into(),
                 http: "0.0.0.0:80".into(),
-                https: "0.0.0.0:443".into(),
+                https: None,
             },
             panel: PanelConfig {
                 user: "admin".into(),
@@ -78,21 +79,18 @@ impl FileConfig {
 [listen]
 quic  = "0.0.0.0:7844"   # Agent QUIC
 panel = "0.0.0.0:8080"   # Web management UI
-http  = "0.0.0.0:80"     # Public HTTP tunnels
-https = "0.0.0.0:443"    # Public HTTPS tunnels
+http  = "0.0.0.0:80"     # Public HTTP(S) front. Port 443 + https_enabled also binds :80 redirect
 
 [panel]
 user     = "admin"
 password = "tunnelx"
 
 [certs]
-# Paths are relative to the data directory (-d), unless absolute.
-quic_cert            = "certs/quic-cert.pem"
-quic_key             = "certs/quic-key.pem"
-# If cert files are missing and this is true, a self-signed pair is generated.
+# Paths are relative to the data directory unless absolute.
+quic_cert             = "certs/quic-cert.pem"
+quic_key              = "certs/quic-key.pem"
 quic_auto_self_signed = true
 
-# User-facing HTTPS (put Let's Encrypt fullchain + privkey here).
 https_cert    = "certs/fullchain.pem"
 https_key     = "certs/privkey.pem"
 https_enabled = true
@@ -100,23 +98,20 @@ https_enabled = true
         .to_string()
     }
 
-    /// Load from path, or write defaults and return them.
     pub fn load_or_create(path: &Path) -> Result<Self> {
         if path.exists() {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("read {}", path.display()))?;
-            let cfg: FileConfig = toml::from_str(&text)
+            let cfg: Self = toml::from_str(&text)
                 .with_context(|| format!("parse {}", path.display()))?;
-            tracing::info!("loaded config from {}", path.display());
             return Ok(cfg);
         }
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let text = Self::default_toml();
-        std::fs::write(path, &text)
-            .with_context(|| format!("write {}", path.display()))?;
-        tracing::info!("wrote default config to {}", path.display());
+        std::fs::write(path, &text).with_context(|| format!("write {}", path.display()))?;
+        tracing::info!("wrote default config {}", path.display());
         Ok(Self::default())
     }
 
@@ -134,7 +129,6 @@ https_enabled = true
             quic_addr: self.listen.quic.parse().context("listen.quic")?,
             panel_addr: self.listen.panel.parse().context("listen.panel")?,
             http_addr: self.listen.http.parse().context("listen.http")?,
-            https_addr: self.listen.https.parse().context("listen.https")?,
             panel_user: self.panel.user,
             panel_pass: self.panel.password,
             quic_cert: Self::resolve(&data_dir, &self.certs.quic_cert),
@@ -154,7 +148,6 @@ pub struct CliOverrides {
     pub quic_addr: Option<String>,
     pub panel_addr: Option<String>,
     pub http_addr: Option<String>,
-    pub https_addr: Option<String>,
     pub panel_user: Option<String>,
     pub panel_pass: Option<String>,
 }
@@ -169,9 +162,6 @@ impl CliOverrides {
         }
         if let Some(v) = self.http_addr {
             file.listen.http = v;
-        }
-        if let Some(v) = self.https_addr {
-            file.listen.https = v;
         }
         if let Some(v) = self.panel_user {
             file.panel.user = v;
