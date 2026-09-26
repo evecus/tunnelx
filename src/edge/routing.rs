@@ -100,7 +100,6 @@ impl ListenerRegistry {
         }
     }
 
-    /// Abort any existing TCP/UDP listener for this rule (releases the public port).
     pub fn stop(&self, rule_id: Uuid) {
         if let Some((_, h)) = self.tcp.remove(&rule_id) {
             h.abort();
@@ -134,9 +133,9 @@ impl ListenerRegistry {
 }
 
 /// Plain HTTP listener that only issues 301 redirects to HTTPS.
-/// Used on :80 when HTTPS is bound to :443.
+/// Used on :80 when the public front is bound to :443 with TLS.
 pub async fn run_http_redirect_listener(state: Arc<EdgeState>, listen: SocketAddr) -> Result<()> {
-    let https_port = state.config.https_addr.port();
+    let https_port = state.config.http_addr.port();
     let listener = TcpListener::bind(listen).await.context("bind http redirect")?;
     info!("HTTP→HTTPS redirect listening on {listen} → https port {https_port}");
 
@@ -190,7 +189,7 @@ fn redirect_to_https(req: Request<Incoming>, https_port: u16) -> Response<Full<B
 }
 
 pub async fn run_http_listener(state: Arc<EdgeState>, tls: bool) -> Result<()> {
-    let addr = if tls { state.config.https_addr } else { state.config.http_addr };
+    let addr = state.config.http_addr;
 
     let tls_acceptor = if tls {
         let cert_path = state.config.https_cert.clone();
@@ -198,7 +197,8 @@ pub async fn run_http_listener(state: Arc<EdgeState>, tls: bool) -> Result<()> {
         if !cert_path.exists() || !key_path.exists() {
             return Err(anyhow!(
                 "HTTPS certs not found at {} / {}",
-                cert_path.display(), key_path.display()
+                cert_path.display(),
+                key_path.display()
             ));
         }
         let server_config = crate::common::load_https_server_config(&cert_path, &key_path)?;
@@ -280,7 +280,12 @@ async fn handle_http_request(
 
     let agent = match state.agents.pick(&tunnel_id) {
         Some(a) => a,
-        None => return Ok(simple_response(StatusCode::BAD_GATEWAY, "no agent online for this tunnel")),
+        None => {
+            return Ok(simple_response(
+                StatusCode::BAD_GATEWAY,
+                "no agent online for this tunnel",
+            ))
+        }
     };
 
     let rule_id = match Uuid::parse_str(&rule.id) {
