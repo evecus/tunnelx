@@ -37,6 +37,7 @@ pub struct EdgeState {
     pub db: Db,
     pub agents: AgentPool,
     pub listeners: ListenerRegistry,
+    pub panel_auth: panel::PanelAuth,
     pub config_version: RwLock<u64>,
 }
 
@@ -53,6 +54,7 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
         db,
         agents: AgentPool::new(),
         listeners: ListenerRegistry::new(),
+        panel_auth: panel::PanelAuth::new(),
         config_version: RwLock::new(1),
     });
 
@@ -63,7 +65,6 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
     info!("  HTTP       = {}", config.http_addr);
     info!("  HTTPS      = {} (enabled={})", config.https_addr, config.https_enabled);
 
-    // QUIC uses UDP. Verify with: ss -ulnp | grep <port>
     let quic_state = state.clone();
     let quic_addr = config.quic_addr;
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
