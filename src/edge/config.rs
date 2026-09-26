@@ -22,10 +22,6 @@ pub struct ListenConfig {
     pub panel: String,
     /// Public HTTP/HTTPS front (one port). TLS if certs.https_enabled.
     pub http: String,
-    /// Deprecated: ignored. Kept so old config.toml still loads.
-    #[serde(default, skip_serializing)]
-    #[allow(dead_code)]
-    pub https: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,7 +50,6 @@ impl Default for FileConfig {
                 quic: "0.0.0.0:7844".into(),
                 panel: "0.0.0.0:8080".into(),
                 http: "0.0.0.0:80".into(),
-                https: None,
             },
             panel: PanelConfig {
                 user: "admin".into(),
