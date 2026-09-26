@@ -86,7 +86,6 @@ impl AgentPool {
     }
 }
 
-/// Tracks TCP/UDP public listeners so we can stop them and free ports.
 pub struct ListenerRegistry {
     tcp: DashMap<Uuid, tokio::task::JoinHandle<()>>,
     udp: DashMap<Uuid, tokio::task::JoinHandle<()>>,
@@ -132,15 +131,29 @@ impl ListenerRegistry {
     }
 }
 
-/// Plain HTTP listener that only issues 301 redirects to HTTPS.
-/// Used on :80 when the public front is bound to :443 with TLS.
-pub async fn run_http_redirect_listener(state: Arc<EdgeState>, listen: SocketAddr) -> Result<()> {
+/// Best-effort :80 HTTP→HTTPS redirect when the public front is :443.
+/// If `listen` is already in use, logs and returns without failing Edge startup.
+pub async fn run_http_redirect_listener(state: Arc<EdgeState>, listen: SocketAddr) {
     let https_port = state.config.http_addr.port();
-    let listener = TcpListener::bind(listen).await.context("bind http redirect")?;
+    let listener = match TcpListener::bind(listen).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::info!(
+                "HTTP→HTTPS redirect on {listen} skipped (optional, port busy or unavailable): {e}"
+            );
+            return;
+        }
+    };
     info!("HTTP→HTTPS redirect listening on {listen} → https port {https_port}");
 
     loop {
-        let (stream, peer) = listener.accept().await?;
+        let (stream, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("HTTP redirect accept error on {listen}: {e}");
+                continue;
+            }
+        };
         tokio::spawn(async move {
             if let Err(e) = serve_http_redirect(TokioIo::new(stream), https_port).await {
                 debug!("redirect conn from {peer}: {e:#}");
