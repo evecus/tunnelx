@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use super::EdgeConfig;
+use crate::common::Congestion;
 
 /// On-disk TOML schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,6 +13,25 @@ pub struct FileConfig {
     pub listen: ListenConfig,
     pub panel: PanelConfig,
     pub certs: CertsConfig,
+    /// Optional in old config files; defaults to BBR when the section is missing.
+    #[serde(default)]
+    pub congestion: CongestionFileConfig,
+}
+
+/// QUIC congestion control settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CongestionFileConfig {
+    /// One of: bbr | brutal | cubic
+    pub algorithm: String,
+    /// Target bandwidth in Mbps — only used when algorithm = "brutal"
+    pub brutal_mbps: u64,
+}
+
+impl Default for CongestionFileConfig {
+    fn default() -> Self {
+        Self { algorithm: "bbr".into(), brutal_mbps: 50 }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +83,7 @@ impl Default for FileConfig {
                 https_key: "certs/privkey.pem".into(),
                 https_enabled: true,
             },
+            congestion: CongestionFileConfig::default(),
         }
     }
 }
@@ -90,6 +111,12 @@ quic_auto_self_signed = true
 https_cert    = "certs/fullchain.pem"
 https_key     = "certs/privkey.pem"
 https_enabled = true
+
+[congestion]
+# QUIC congestion control for the Agent tunnel: bbr | brutal | cubic
+algorithm   = "bbr"
+# Target bandwidth in Mbps — only used when algorithm = "brutal"
+brutal_mbps = 50
 "#
         .to_string()
     }
@@ -121,6 +148,9 @@ https_enabled = true
     }
 
     pub fn into_edge_config(self, data_dir: PathBuf) -> Result<EdgeConfig> {
+        let congestion =
+            Congestion::parse(&self.congestion.algorithm, self.congestion.brutal_mbps)
+                .context("parse congestion settings")?;
         Ok(EdgeConfig {
             quic_addr: self.listen.quic.parse().context("listen.quic")?,
             panel_addr: self.listen.panel.parse().context("listen.panel")?,
@@ -133,6 +163,7 @@ https_enabled = true
             https_cert: Self::resolve(&data_dir, &self.certs.https_cert),
             https_key: Self::resolve(&data_dir, &self.certs.https_key),
             https_enabled: self.certs.https_enabled,
+            congestion,
             data_dir,
         })
     }

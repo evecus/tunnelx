@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::common::make_quic_client_config;
+use crate::common::{make_quic_client_config, Congestion};
 use crate::protocol::{
     encode_message, try_decode_message, ConfigUpdate, ControlMessage, DataStreamHeader,
     DataStreamType, IngressRule, RegisterRequest,
@@ -18,6 +18,7 @@ pub struct AgentConfig {
     pub server: String,
     pub token: String,
     pub name: String,
+    pub congestion: Congestion,
 }
 
 struct AgentState {
@@ -44,7 +45,7 @@ pub async fn run(config: AgentConfig) -> Result<()> {
 async fn connect_and_run(state: Arc<AgentState>) -> Result<()> {
     let addr = state.config.server.to_socket_addrs()?.next()
         .ok_or_else(|| anyhow!("cannot resolve {}", state.config.server))?;
-    let client_config = make_quic_client_config()?;
+    let client_config = make_quic_client_config(state.config.congestion)?;
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
     endpoint.set_default_client_config(client_config);
     let conn = endpoint.connect(addr, "tunnelx")?.await.context("QUIC connect")?;

@@ -1,10 +1,14 @@
 //! Shared utilities.
 
+pub mod congestion;
+
 use anyhow::{Context, Result};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
+
+pub use congestion::Congestion;
 
 /// Install the ring CryptoProvider once (required by rustls 0.23).
 pub fn install_crypto_provider() {
@@ -53,6 +57,7 @@ pub fn load_or_generate_quic_cert(
 pub fn make_quic_server_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
+    congestion: Congestion,
 ) -> Result<quinn::ServerConfig> {
     install_crypto_provider();
     let mut server_crypto = rustls::ServerConfig::builder()
@@ -68,12 +73,13 @@ pub fn make_quic_server_config(
         t.max_concurrent_bidi_streams(1024u32.into());
         t.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
         t.max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into().unwrap()));
+        t.congestion_controller_factory(congestion.controller_factory());
         t
     });
     Ok(server_config)
 }
 
-pub fn make_quic_client_config() -> Result<quinn::ClientConfig> {
+pub fn make_quic_client_config(congestion: Congestion) -> Result<quinn::ClientConfig> {
     install_crypto_provider();
     let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
@@ -89,6 +95,7 @@ pub fn make_quic_client_config() -> Result<quinn::ClientConfig> {
         // Keep the path alive behind NAT / middleboxes
         t.keep_alive_interval(Some(std::time::Duration::from_secs(10)));
         t.max_idle_timeout(Some(std::time::Duration::from_secs(60).try_into().unwrap()));
+        t.congestion_controller_factory(congestion.controller_factory());
         t
     }));
     Ok(client_config)

@@ -11,6 +11,8 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::info;
 
+use crate::common::Congestion;
+
 pub use config::{load_edge_config, CliOverrides};
 pub use db::Db;
 pub use routing::{AgentPool, ListenerRegistry};
@@ -29,6 +31,7 @@ pub struct EdgeConfig {
     pub https_cert: PathBuf,
     pub https_key: PathBuf,
     pub https_enabled: bool,
+    pub congestion: Congestion,
 }
 
 pub struct EdgeState {
@@ -60,6 +63,7 @@ pub async fn run(config: EdgeConfig) -> Result<()> {
     info!("Edge starting");
     info!("  data_dir   = {}", config.data_dir.display());
     info!("  QUIC       = UDP {}", config.quic_addr);
+    info!("  congestion = {:?}", config.congestion);
     info!("  panel      = http://{}", config.panel_addr);
     info!(
         "  public HTTP(S) = {} (https_enabled={})",

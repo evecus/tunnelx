@@ -56,6 +56,14 @@ enum Commands {
         /// Optional agent name for identification
         #[arg(long, default_value = "")]
         name: String,
+
+        /// QUIC congestion control: bbr | brutal | cubic
+        #[arg(long, default_value = "bbr")]
+        congestion: String,
+
+        /// Target bandwidth in Mbps — only used when congestion = brutal
+        #[arg(long, default_value_t = 50)]
+        brutal_mbps: u64,
     },
 }
 
@@ -93,10 +101,13 @@ async fn main() -> Result<()> {
             )?;
             edge::run(config).await
         }
-        Commands::Agent { server, token, name } => {
+        Commands::Agent { server, token, name, congestion, brutal_mbps } => {
+            let congestion =
+                common::Congestion::parse(&congestion, brutal_mbps).context("parse --congestion")?;
             agent::run(agent::AgentConfig {
                 server,
                 token,
+                congestion,
                 name: if name.is_empty() {
                     hostname::get()
                         .ok()

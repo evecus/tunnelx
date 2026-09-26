@@ -39,7 +39,7 @@ pub async fn run_quic_server(
             return Err(e);
         }
     };
-    let server_config = match make_quic_server_config(certs, key) {
+    let server_config = match make_quic_server_config(certs, key, state.config.congestion) {
         Ok(c) => c,
         Err(e) => {
             notify(Err(anyhow!("{e:#}")));
