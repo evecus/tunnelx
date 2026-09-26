@@ -133,6 +133,62 @@ impl ListenerRegistry {
     }
 }
 
+/// Plain HTTP listener that only issues 301 redirects to HTTPS.
+/// Used on :80 when HTTPS is bound to :443.
+pub async fn run_http_redirect_listener(state: Arc<EdgeState>, listen: SocketAddr) -> Result<()> {
+    let https_port = state.config.https_addr.port();
+    let listener = TcpListener::bind(listen).await.context("bind http redirect")?;
+    info!("HTTP→HTTPS redirect listening on {listen} → https port {https_port}");
+
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        tokio::spawn(async move {
+            if let Err(e) = serve_http_redirect(TokioIo::new(stream), https_port).await {
+                debug!("redirect conn from {peer}: {e:#}");
+            }
+        });
+    }
+}
+
+async fn serve_http_redirect<S>(io: TokioIo<S>, https_port: u16) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let service = hyper::service::service_fn(move |req: Request<Incoming>| async move {
+        Ok::<_, std::convert::Infallible>(redirect_to_https(req, https_port))
+    });
+    hyper::server::conn::http1::Builder::new()
+        .serve_connection(io, service)
+        .await
+        .context("http1 redirect serve")?;
+    Ok(())
+}
+
+fn redirect_to_https(req: Request<Incoming>, https_port: u16) -> Response<Full<Bytes>> {
+    let host_raw = req
+        .headers()
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    let host_only = host_raw.split(':').next().unwrap_or("localhost");
+    let path = req
+        .uri()
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/");
+    let location = if https_port == 443 {
+        format!("https://{host_only}{path}")
+    } else {
+        format!("https://{host_only}:{https_port}{path}")
+    };
+    Response::builder()
+        .status(StatusCode::MOVED_PERMANENTLY)
+        .header("location", location)
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(Full::new(Bytes::from("Redirecting to HTTPS\n")))
+        .unwrap()
+}
+
 pub async fn run_http_listener(state: Arc<EdgeState>, tls: bool) -> Result<()> {
     let addr = if tls { state.config.https_addr } else { state.config.http_addr };
 
