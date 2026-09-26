@@ -1,13 +1,18 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::Response;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use super::routing::{AgentHandle, OpenStreamReq};
 use super::EdgeState;
+use crate::common::{load_or_generate_quic_cert, make_quic_server_config};
 use crate::protocol::{
-    decode_message, encode_message, try_decode_message, ConfigUpdate, ControlMessage,
+    encode_message, try_decode_message, ConfigUpdate, ControlMessage,
     DataStreamType, RegisterResponse,
 };
 
@@ -15,45 +20,71 @@ pub async fn run_quic_server(
     state: Arc<EdgeState>,
     ready: Option<tokio::sync::oneshot::Sender<Result<()>>>,
 ) -> Result<()> {
-    let addr = state.config.quic_addr;
-    let (server_config, _) = crate::common::make_quic_server_config(
-        &state.config.quic_cert,
-        &state.config.quic_key,
-        state.config.quic_auto_self_signed,
-    )?;
-
-    let endpoint = match quinn::Endpoint::server(server_config, addr) {
-        Ok(ep) => {
-            if let Some(tx) = ready {
-                let _ = tx.send(Ok(()));
-            }
-            ep
-        }
-        Err(e) => {
-            let err = anyhow::anyhow!("QUIC bind {addr}: {e:#}");
-            if let Some(tx) = ready {
-                let _ = tx.send(Err(anyhow::anyhow!("{err:#}")));
-            }
-            return Err(err);
+    let notify = |r: Result<()>| {
+        if let Some(tx) = ready {
+            let _ = tx.send(r);
         }
     };
 
-    info!("QUIC listening on UDP {addr}");
-
+    let cert_path = &state.config.quic_cert;
+    let key_path = &state.config.quic_key;
+    let (certs, key) = match load_or_generate_quic_cert(
+        cert_path,
+        key_path,
+        state.config.quic_auto_self_signed,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            notify(Err(anyhow!("{e:#}")));
+            return Err(e);
+        }
+    };
+    let server_config = match make_quic_server_config(certs, key) {
+        Ok(c) => c,
+        Err(e) => {
+            notify(Err(anyhow!("{e:#}")));
+            return Err(e);
+        }
+    };
+    let endpoint = match quinn::Endpoint::server(server_config, state.config.quic_addr) {
+        Ok(ep) => ep,
+        Err(e) => {
+            let msg = format!("bind QUIC UDP on {}: {e}", state.config.quic_addr);
+            notify(Err(anyhow!("{msg}")));
+            return Err(anyhow!("{msg}"));
+        }
+    };
+    info!(
+        "QUIC server listening on UDP {} (Agents connect here)",
+        state.config.quic_addr
+    );
+    notify(Ok(()));
     while let Some(connecting) = endpoint.accept().await {
         let state = state.clone();
         tokio::spawn(async move {
             match connecting.await {
                 Ok(conn) => {
                     if let Err(e) = handle_agent_connection(state, conn).await {
-                        warn!("agent connection ended: {e:#}");
+                        warn!("agent connection closed: {e:#}");
                     }
                 }
-                Err(e) => warn!("QUIC handshake failed: {e}"),
+                Err(e) => warn!("QUIC accept error: {e}"),
             }
         });
     }
     Ok(())
+}
+
+async fn read_one_message(recv: &mut quinn::RecvStream) -> Result<ControlMessage> {
+    let mut len_buf = [0u8; 4];
+    recv.read_exact(&mut len_buf).await.context("read msg len")?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len == 0 || len > 16 * 1024 * 1024 {
+        anyhow::bail!("invalid control message length {len}");
+    }
+    let mut payload = vec![0u8; len];
+    recv.read_exact(&mut payload).await.context("read msg payload")?;
+    bincode::deserialize(&payload).context("decode control message")
 }
 
 async fn handle_agent_connection(state: Arc<EdgeState>, conn: quinn::Connection) -> Result<()> {
@@ -66,10 +97,7 @@ async fn handle_agent_connection(state: Arc<EdgeState>, conn: quinn::Connection)
         Err(e) => {
             warn!("register read from {remote}: {e:#}");
             let resp = ControlMessage::RegisterResponse(RegisterResponse {
-                ok: false,
-                tunnel_id: None,
-                message: format!("bad register: {e:#}"),
-                config: None,
+                ok: false, tunnel_id: None, message: format!("bad register: {e:#}"), config: None,
             });
             let _ = send.write_all(&encode_message(&resp)?).await;
             return Err(e);
@@ -77,45 +105,34 @@ async fn handle_agent_connection(state: Arc<EdgeState>, conn: quinn::Connection)
     };
     let ControlMessage::Register(reg) = msg else {
         let resp = ControlMessage::RegisterResponse(RegisterResponse {
-            ok: false,
-            tunnel_id: None,
-            message: "expected Register".into(),
-            config: None,
+            ok: false, tunnel_id: None, message: "expected Register".into(), config: None,
         });
         let _ = send.write_all(&encode_message(&resp)?).await;
         anyhow::bail!("expected Register from {remote}");
     };
 
-    let tunnel = match state.db.get_tunnel_by_token(&reg.token).await? {
-        Some(t) => t,
-        None => {
+    let tunnel = match state.db.get_tunnel_by_token(&reg.token).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            warn!("invalid token from {remote} agent={}", reg.agent_name);
             let resp = ControlMessage::RegisterResponse(RegisterResponse {
-                ok: false,
-                tunnel_id: None,
-                message: "invalid token".into(),
-                config: None,
+                ok: false, tunnel_id: None, message: "invalid token".into(), config: None,
             });
             let _ = send.write_all(&encode_message(&resp)?).await;
             anyhow::bail!("invalid token from {remote}");
         }
-    };
-    let tunnel_id = match Uuid::parse_str(&tunnel.id) {
-        Ok(id) => id,
         Err(e) => {
             let resp = ControlMessage::RegisterResponse(RegisterResponse {
-                ok: false,
-                tunnel_id: None,
-                message: format!("bad tunnel id: {e}"),
-                config: None,
+                ok: false, tunnel_id: None, message: format!("db error: {e:#}"), config: None,
             });
             let _ = send.write_all(&encode_message(&resp)?).await;
-            return Err(e.into());
+            return Err(e);
         }
     };
 
-    let rules = state.db.rules_for_tunnel(&tunnel.id).await.unwrap_or_default();
+    let tunnel_id = Uuid::parse_str(&tunnel.id)?;
+    let rules = state.db.rules_for_tunnel(&tunnel.id).await?;
     let version = *state.config_version.read().await;
-
     let (tx, mut rx) = mpsc::unbounded_channel::<OpenStreamReq>();
     let (cfg_tx, mut cfg_rx) = mpsc::unbounded_channel::<ConfigUpdate>();
     let handle = AgentHandle {
@@ -140,17 +157,11 @@ async fn handle_agent_connection(state: Arc<EdgeState>, conn: quinn::Connection)
     }
 
     let resp = ControlMessage::RegisterResponse(RegisterResponse {
-        ok: true,
-        tunnel_id: Some(tunnel_id),
-        message: "ok".into(),
+        ok: true, tunnel_id: Some(tunnel_id), message: "ok".into(),
         config: Some(ConfigUpdate { version, rules }),
     });
     send.write_all(&encode_message(&resp)?).await?;
-    info!(
-        "Agent {} ({}) registered for tunnel {} ({})",
-        reg.agent_name, reg.agent_id, tunnel.name, tunnel_id
-    );
-
+    info!("Agent {} ({}) registered for tunnel {} ({})", reg.agent_name, reg.agent_id, tunnel.name, tunnel_id);
     let conn2 = conn.clone();
     let open_task = tokio::spawn(async move {
         while let Some(req) = rx.recv().await {
@@ -200,120 +211,96 @@ async fn handle_agent_connection(state: Arc<EdgeState>, conn: quinn::Connection)
     Ok(())
 }
 
-async fn read_one_message(recv: &mut quinn::RecvStream) -> Result<ControlMessage> {
-    let mut buf = Vec::new();
-    loop {
-        let Some(chunk) = recv.read_chunk(8192, true).await? else {
-            anyhow::bail!("control stream closed before register");
-        };
-        buf.extend_from_slice(&chunk.bytes);
-        if let Ok(Some((msg, _))) = try_decode_message(&buf) {
-            return Ok(msg);
-        }
-        if buf.len() > 1024 * 1024 {
-            anyhow::bail!("register message too large");
-        }
-    }
-}
-
 async fn open_data_stream(conn: quinn::Connection, req: OpenStreamReq) -> Result<()> {
-    let (mut send, mut recv) = conn.open_bi().await.context("open data bi")?;
-    let header = encode_message(&ControlMessage::DataStreamOpen(req.header.clone()))?;
-    send.write_all(&header).await?;
-
+    let (mut send, mut recv) = conn.open_bi().await.context("open bi stream")?;
+    let header_bytes = bincode::serialize(&req.header)?;
+    let mut hdr = Vec::with_capacity(4 + header_bytes.len());
+    hdr.extend_from_slice(&(header_bytes.len() as u32).to_be_bytes());
+    hdr.extend_from_slice(&header_bytes);
+    send.write_all(&hdr).await?;
     match req.header.stream_type {
         DataStreamType::Tcp => {
-            let public = req
-                .public_tcp
-                .ok_or_else(|| anyhow::anyhow!("tcp open without public stream"))?;
-            let (mut pr, mut pw) = public.into_split();
-            let (mut sr, mut sw) = (recv, send);
-            let a = tokio::spawn(async move {
-                let _ = tokio::io::copy(&mut pr, &mut sw).await;
-                let _ = sw.finish();
+            let public = req.public_tcp.ok_or_else(|| anyhow!("missing public_tcp"))?;
+            let (mut pub_r, mut pub_w) = public.into_split();
+            let t1 = tokio::spawn(async move {
+                let mut buf = [0u8; 16384];
+                loop {
+                    match pub_r.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => { if send.write_all(&buf[..n]).await.is_err() { break; } }
+                    }
+                }
+                let _ = send.finish();
             });
-            let b = tokio::spawn(async move {
-                let _ = tokio::io::copy(&mut sr, &mut pw).await;
+            let t2 = tokio::spawn(async move {
+                let mut buf = [0u8; 16384];
+                loop {
+                    match recv.read(&mut buf).await {
+                        Ok(Some(n)) if n > 0 => { if pub_w.write_all(&buf[..n]).await.is_err() { break; } }
+                        _ => break,
+                    }
+                }
             });
-            let _ = tokio::join!(a, b);
+            let _ = tokio::join!(t1, t2);
         }
         DataStreamType::Http => {
-            // HTTP proxying is handled on the agent side after DataStreamOpen;
-            // Edge currently expects the agent path via control + data streams.
-            // Placeholder: close if incomplete wiring.
-            if let Some(tx) = req.http_tx {
-                let _ = tx.send(
-                    hyper::Response::builder()
-                        .status(502)
-                        .body(http_body_util::Full::new(bytes::Bytes::from(
-                            "HTTP data path not fully wired on Edge open",
-                        )))
-                        .unwrap(),
-                );
+            let mut http_req = req.http_req.ok_or_else(|| anyhow!("missing http_req"))?;
+            let tx = req.http_tx.ok_or_else(|| anyhow!("missing http_tx"))?;
+            let body_bytes = http_req.body_mut().collect().await?.to_bytes();
+            let method = http_req.method().as_str().to_string();
+            let uri = http_req.uri().to_string();
+            let mut headers = Vec::new();
+            for (k, v) in http_req.headers() {
+                if let Ok(v) = v.to_str() { headers.push((k.as_str().to_string(), v.to_string())); }
             }
-            let _ = req.http_req;
-            let _ = (send, recv);
+            #[derive(serde::Serialize)]
+            struct HttpReqWire { method: String, uri: String, headers: Vec<(String, String)>, body: Vec<u8> }
+            let wire = HttpReqWire { method, uri, headers, body: body_bytes.to_vec() };
+            let payload = bincode::serialize(&wire)?;
+            send.write_all(&(payload.len() as u32).to_be_bytes()).await?;
+            send.write_all(&payload).await?;
+            send.finish()?;
+            let mut len_buf = [0u8; 4];
+            recv.read_exact(&mut len_buf).await?;
+            let len = u32::from_be_bytes(len_buf) as usize;
+            let mut resp_buf = vec![0u8; len];
+            recv.read_exact(&mut resp_buf).await?;
+            #[derive(serde::Deserialize)]
+            struct HttpRespWire { status: u16, headers: Vec<(String, String)>, body: Vec<u8> }
+            let resp_wire: HttpRespWire = bincode::deserialize(&resp_buf)?;
+            let mut builder = Response::builder().status(resp_wire.status);
+            for (k, v) in resp_wire.headers { builder = builder.header(k, v); }
+            let response = builder.body(Full::new(Bytes::from(resp_wire.body))).unwrap_or_else(|_| {
+                Response::builder().status(502).body(Full::new(Bytes::from("bad response"))).unwrap()
+            });
+            let _ = tx.send(response);
         }
         DataStreamType::Udp => {
-            let mut to_agent = req
-                .udp_to_agent
-                .ok_or_else(|| anyhow::anyhow!("udp open without to_agent"))?;
-            let from_agent = req
-                .udp_from_agent
-                .ok_or_else(|| anyhow::anyhow!("udp open without from_agent"))?;
-            let mut send = send;
-            let mut recv = recv;
-            let up = tokio::spawn(async move {
+            let mut to_agent = req.udp_to_agent.ok_or_else(|| anyhow!("missing udp_to_agent"))?;
+            let from_agent = req.udp_from_agent.ok_or_else(|| anyhow!("missing udp_from_agent"))?;
+            let t1 = tokio::spawn(async move {
                 while let Some(pkt) = to_agent.recv().await {
-                    let len = (pkt.len() as u32).to_be_bytes();
-                    if send.write_all(&len).await.is_err() {
-                        break;
-                    }
-                    if send.write_all(&pkt).await.is_err() {
-                        break;
-                    }
+                    if pkt.len() > 65535 { continue; }
+                    let mut frame = Vec::with_capacity(4 + pkt.len());
+                    frame.extend_from_slice(&(pkt.len() as u32).to_be_bytes());
+                    frame.extend_from_slice(&pkt);
+                    if send.write_all(&frame).await.is_err() { break; }
                 }
+                let _ = send.finish();
             });
-            let down = tokio::spawn(async move {
-                let mut len_buf = [0u8; 4];
+            let t2 = tokio::spawn(async move {
                 loop {
-                    if tokio::io::AsyncReadExt::read_exact(&mut recv, &mut len_buf)
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    let n = u32::from_be_bytes(len_buf) as usize;
-                    if n > 65535 {
-                        break;
-                    }
-                    let mut buf = vec![0u8; n];
-                    if tokio::io::AsyncReadExt::read_exact(&mut recv, &mut buf)
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    if from_agent.send(buf).await.is_err() {
-                        break;
-                    }
+                    let mut len_buf = [0u8; 4];
+                    if recv.read_exact(&mut len_buf).await.is_err() { break; }
+                    let len = u32::from_be_bytes(len_buf) as usize;
+                    if len == 0 || len > 65535 { break; }
+                    let mut pkt = vec![0u8; len];
+                    if recv.read_exact(&mut pkt).await.is_err() { break; }
+                    if from_agent.send(pkt).await.is_err() { break; }
                 }
             });
-            let _ = tokio::join!(up, down);
+            let _ = tokio::join!(t1, t2);
         }
     }
     Ok(())
-}
-
-async fn read_one_message_from_bytes(data: &[u8]) -> Result<(ControlMessage, usize)> {
-    match try_decode_message(data) {
-        Ok(Some(v)) => Ok(v),
-        Ok(None) => anyhow::bail!("incomplete"),
-        Err(e) => Err(e),
-    }
-}
-
-#[allow(dead_code)]
-fn _use_decode(data: &[u8]) -> Result<ControlMessage> {
-    decode_message(data)
 }
