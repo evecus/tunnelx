@@ -193,26 +193,16 @@ async fn add_rule(State(state): State<Arc<EdgeState>>, Path(tunnel_id): Path<Str
             *state.config_version.write().await += 1;
             if st == ServiceType::Tcp {
                 if let Some(port) = form.public_port {
-                    let st2 = state.clone();
-                    let rid = Uuid::parse_str(&rule.id).unwrap();
-                    let target = rule.target.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = super::routing::run_tcp_listener(st2, rid, port, target).await {
-                            tracing::error!("TCP listener :{port}: {e:#}");
-                        }
-                    });
+                    if let Ok(rid) = Uuid::parse_str(&rule.id) {
+                        state.listeners.start_tcp(state.clone(), rid, port, rule.target.clone());
+                    }
                 }
             }
             if st == ServiceType::Udp {
                 if let Some(port) = form.public_port {
-                    let st2 = state.clone();
-                    let rid = Uuid::parse_str(&rule.id).unwrap();
-                    let target = rule.target.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = super::routing::run_udp_listener(st2, rid, port, target).await {
-                            tracing::error!("UDP listener :{port}: {e:#}");
-                        }
-                    });
+                    if let Ok(rid) = Uuid::parse_str(&rule.id) {
+                        state.listeners.start_udp(state.clone(), rid, port, rule.target.clone());
+                    }
                 }
             }
             if let Ok(tid) = Uuid::parse_str(&tunnel_id) {
@@ -244,33 +234,18 @@ async fn toggle_rule(State(state): State<Arc<EdgeState>>, Path(id): Path<String>
     }
     *state.config_version.write().await += 1;
 
-    // If enabling a TCP/UDP rule, ensure a public listener is running.
-    if new_enabled {
-        if let Some(port) = rule.public_port {
-            let port = port as u16;
-            let rid = match Uuid::parse_str(&rule.id) {
-                Ok(u) => u,
-                Err(_) => return Redirect::to(&format!("/tunnels/{}", rule.tunnel_id)).into_response(),
-            };
-            let st2 = state.clone();
-            let target = rule.target.clone();
-            match rule.service_type.as_str() {
-                "tcp" => {
-                    tokio::spawn(async move {
-                        if let Err(e) = super::routing::run_tcp_listener(st2, rid, port, target).await {
-                            tracing::warn!("TCP listener :{port} (re-enable): {e:#}");
-                        }
-                    });
+    if let Ok(rid) = Uuid::parse_str(&rule.id) {
+        if new_enabled {
+            if let Some(port) = rule.public_port {
+                let port = port as u16;
+                match rule.service_type.as_str() {
+                    "tcp" => state.listeners.start_tcp(state.clone(), rid, port, rule.target.clone()),
+                    "udp" => state.listeners.start_udp(state.clone(), rid, port, rule.target.clone()),
+                    _ => {}
                 }
-                "udp" => {
-                    tokio::spawn(async move {
-                        if let Err(e) = super::routing::run_udp_listener(st2, rid, port, target).await {
-                            tracing::warn!("UDP listener :{port} (re-enable): {e:#}");
-                        }
-                    });
-                }
-                _ => {}
             }
+        } else {
+            state.listeners.stop(rid);
         }
     }
 
@@ -289,6 +264,11 @@ async fn toggle_rule(State(state): State<Arc<EdgeState>>, Path(id): Path<String>
 async fn delete_rule(State(state): State<Arc<EdgeState>>, Path(id): Path<String>,
     auth: Option<TypedHeader<Authorization<Basic>>>) -> impl IntoResponse {
     if check_auth(&state, auth).await.is_err() { return unauthorized().into_response(); }
+    if let Ok(Some(rule)) = state.db.get_rule(&id).await {
+        if let Ok(rid) = Uuid::parse_str(&rule.id) {
+            state.listeners.stop(rid);
+        }
+    }
     let _ = state.db.delete_rule(&id).await;
     *state.config_version.write().await += 1;
     if let Ok(tunnels) = state.db.list_tunnels().await {
@@ -305,6 +285,14 @@ async fn delete_rule(State(state): State<Arc<EdgeState>>, Path(id): Path<String>
 async fn delete_tunnel(State(state): State<Arc<EdgeState>>, Path(id): Path<String>,
     auth: Option<TypedHeader<Authorization<Basic>>>) -> impl IntoResponse {
     if check_auth(&state, auth).await.is_err() { return unauthorized().into_response(); }
+    // Stop all listeners for rules under this tunnel before delete
+    if let Ok(rules) = state.db.list_rules(&id).await {
+        for r in rules {
+            if let Ok(rid) = Uuid::parse_str(&r.id) {
+                state.listeners.stop(rid);
+            }
+        }
+    }
     let _ = state.db.delete_tunnel(&id).await;
     Redirect::to("/tunnels").into_response()
 }
