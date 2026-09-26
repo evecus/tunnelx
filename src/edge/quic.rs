@@ -87,6 +87,27 @@ async fn read_one_message(recv: &mut quinn::RecvStream) -> Result<ControlMessage
     bincode::deserialize(&payload).context("decode control message")
 }
 
+/// Write a rejection response and give it time to reach the peer.
+///
+/// Dropping the connection discards unacked stream data, so without this wait
+/// the agent would only ever see "closed by peer: 0" and never the reason.
+async fn reject(send: &mut quinn::SendStream, tunnel_id: Option<Uuid>, message: String) {
+    let resp = ControlMessage::RegisterResponse(RegisterResponse {
+        ok: false,
+        tunnel_id,
+        message,
+        config: None,
+    });
+    match encode_message(&resp) {
+        Ok(bytes) => {
+            let _ = send.write_all(&bytes).await;
+            let _ = send.finish();
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        Err(e) => tracing::warn!("encode rejection response: {e:#}"),
+    }
+}
+
 async fn handle_agent_connection(state: Arc<EdgeState>, conn: quinn::Connection) -> Result<()> {
     let remote = conn.remote_address();
     info!("new QUIC connection from {remote}");
@@ -96,18 +117,13 @@ async fn handle_agent_connection(state: Arc<EdgeState>, conn: quinn::Connection)
         Ok(m) => m,
         Err(e) => {
             warn!("register read from {remote}: {e:#}");
-            let resp = ControlMessage::RegisterResponse(RegisterResponse {
-                ok: false, tunnel_id: None, message: format!("bad register: {e:#}"), config: None,
-            });
-            let _ = send.write_all(&encode_message(&resp)?).await;
+            reject(&mut send, None, format!("bad register: {e:#}")).await;
             return Err(e);
         }
     };
     let ControlMessage::Register(reg) = msg else {
-        let resp = ControlMessage::RegisterResponse(RegisterResponse {
-            ok: false, tunnel_id: None, message: "expected Register".into(), config: None,
-        });
-        let _ = send.write_all(&encode_message(&resp)?).await;
+        warn!("unexpected first message from {remote}");
+        reject(&mut send, None, "expected Register".into()).await;
         anyhow::bail!("expected Register from {remote}");
     };
 
@@ -115,17 +131,12 @@ async fn handle_agent_connection(state: Arc<EdgeState>, conn: quinn::Connection)
         Ok(Some(t)) => t,
         Ok(None) => {
             warn!("invalid token from {remote} agent={}", reg.agent_name);
-            let resp = ControlMessage::RegisterResponse(RegisterResponse {
-                ok: false, tunnel_id: None, message: "invalid token".into(), config: None,
-            });
-            let _ = send.write_all(&encode_message(&resp)?).await;
+            reject(&mut send, None, "invalid token".into()).await;
             anyhow::bail!("invalid token from {remote}");
         }
         Err(e) => {
-            let resp = ControlMessage::RegisterResponse(RegisterResponse {
-                ok: false, tunnel_id: None, message: format!("db error: {e:#}"), config: None,
-            });
-            let _ = send.write_all(&encode_message(&resp)?).await;
+            warn!("db error from {remote}: {e:#}");
+            reject(&mut send, None, format!("db error: {e:#}")).await;
             return Err(e);
         }
     };
@@ -142,17 +153,16 @@ async fn handle_agent_connection(state: Arc<EdgeState>, conn: quinn::Connection)
         config_tx: cfg_tx,
     };
     if !state.agents.try_register(tunnel_id, handle) {
-        let resp = ControlMessage::RegisterResponse(RegisterResponse {
-            ok: false,
-            tunnel_id: Some(tunnel_id),
-            message: "tunnel already has an agent online; only one agent per token".into(),
-            config: None,
-        });
-        let _ = send.write_all(&encode_message(&resp)?).await;
         warn!(
             "rejected agent {} ({}) for tunnel {} — already occupied",
             reg.agent_name, reg.agent_id, tunnel.name
         );
+        reject(
+            &mut send,
+            Some(tunnel_id),
+            "tunnel already has an agent online; only one agent per token".into(),
+        )
+        .await;
         return Ok(());
     }
 
