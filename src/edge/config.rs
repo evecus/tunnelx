@@ -24,6 +24,7 @@ pub struct ListenConfig {
     pub http: String,
     /// Deprecated: ignored. Kept so old config.toml still loads.
     #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
     pub https: Option<String>,
 }
 
