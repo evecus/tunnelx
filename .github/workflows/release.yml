@@ -15,16 +15,21 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             arch: amd64
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
             arch: arm64
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -46,7 +51,7 @@ jobs:
           cp "$BIN" "$OUT"
           chmod +x "$OUT"
           tar -czf "${OUT}.tar.gz" "$OUT"
-          sha256sum "${OUT}.tar.gz" > "${OUT}.tar.gz.sha256"
+          sha256sum "\( {OUT}.tar.gz" > " \){OUT}.tar.gz.sha256"
           ls -lh "${OUT}"* 
 
       - name: Upload artifact
