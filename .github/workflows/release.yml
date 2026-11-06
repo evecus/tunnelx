@@ -17,10 +17,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            arch: amd64
+            arch: x86_64
           - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
-            arch: arm64
+            arch: aarch64
 
     steps:
       - name: Checkout
@@ -46,7 +46,7 @@ jobs:
 
       - run: |
           mkdir dist
-          mv target/${{ matrix.target }}/release/tunnelx dist/tunnelx-linux-${{ matrix.target }}
+          mv target/${{ matrix.target }}/release/tunnelx dist/tunnelx-linux-${{ matrix.arch }}
       
       - name: Create Release
         uses: softprops/action-gh-release@v2
