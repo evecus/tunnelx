@@ -12,7 +12,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   BIN_NAME: tunnelx
-  RELEASE_NAME: tunnelx
+  RELEASE_NAME: Tunnelx
 
 jobs:
   build:
