@@ -1,55 +1,73 @@
-name: Build & Release
+name: release
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: '发布版本号 (例如: v1.0.0)'
+        required: true
+        default: 'v0.1.0'
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  BIN_NAME: tunnelx
+  RELEASE_NAME: tunnelx
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.run }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            arch: x86_64
+            name: linux-x86_64
+            run: ubuntu-latest
           - target: aarch64-unknown-linux-musl
-            os: ubuntu-24.04-arm
-            arch: aarch64
+            name: linux-arm64
+            run: ubuntu-24.04-arm
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install musl tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
-      - name: Install Rust
+      - uses: actions/checkout@v4
+      
+     
+      
+      - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.name }}
 
-      - name: Build release
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - run: |
-          mkdir dist
-          mv target/${{ matrix.target }}/release/tunnelx dist/tunnelx-linux-${{ matrix.arch }}
+      - name: Inject version
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+        run: |
+          V="${VERSION#v}"
+          sed -i '/^\[package\]/,/^\[/{/^\[package\]/!{s/^version[[:space:]]*=.*/version = "'"${V}"'"/}}' Cargo.toml
       
+      - name: Update Cargo.lock
+        run: cargo update
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build (${{ matrix.target }}, release)
+        run: cargo build --release --target ${{ matrix.target }} --locked
+
+      - name: Rename artifact
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/${BIN_NAME} \
+             dist/${BIN_NAME}-${{ matrix.name }}
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: test
+          name: ${{ env.RELEASE_NAME }} ${{ github.event.inputs.version }}
+          tag_name: ${{ github.event.inputs.version }}
           files: dist/*

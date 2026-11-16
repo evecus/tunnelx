@@ -1,0 +1,41 @@
+name: linux arm64 ci
+
+on:
+  workflow_dispatch:
+
+env:
+  BIN_NAME: tunnelx
+
+jobs:
+  build-arm64-musl:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-arm64
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build (aarch64-unknown-linux-musl, release)
+        run: cargo build --release --target aarch64-unknown-linux-musl
+
+      - name: Collect artifact
+        run: |
+          cp target/aarch64-unknown-linux-musl/release/${{ env.BIN_NAME }} ${{ env.BIN_NAME }}-linux-arm64
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: test
+          prerelease: true
+          files: ${{ env.BIN_NAME }}-linux-arm64
