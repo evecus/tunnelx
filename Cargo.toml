@@ -64,4 +64,5 @@ brutal-core = "0.1"
 lto = true
 codegen-units = 1
 strip = true
-opt-level = 3
+opt-level = 2
+panic = "abort"
